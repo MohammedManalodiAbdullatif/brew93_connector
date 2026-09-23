@@ -1,0 +1,24 @@
+{% extends "templates/web.html" %}
+{% block title %}{{ _("Brew93 Connection") }}{% endblock %}
+{% block page_content %}
+<div class="brew93-status-wrap">
+    <div class="brew93-status-card">
+        <h1>{{ _("Brew93 Connection") }}</h1>
+        <p id="brew93-status" role="status">{{ _("Checking connection...") }}</p>
+        <p id="brew93-tenant" class="text-muted"></p>
+    </div>
+</div>
+<script>
+frappe.ready(function () {
+    frappe.call({
+        method: "brew93_connector.api.settings.get_connection_status",
+        callback: function (r) {
+            const data = (r && r.message) || {};
+            document.getElementById("brew93-status").textContent = data.status || "Disconnected";
+            document.getElementById("brew93-tenant").textContent = data.tenant_id ? __("Tenant: {0}", [data.tenant_id]) : "";
+        },
+        error: function () { document.getElementById("brew93-status").textContent = __("Disconnected"); }
+    });
+});
+</script>
+{% endblock %}

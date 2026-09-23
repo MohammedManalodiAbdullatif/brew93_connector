@@ -1,0 +1,9 @@
+{
+  "doctype": "Page",
+  "name": "brew93-integration",
+  "page_name": "brew93-integration",
+  "module": "Brew93 Connector",
+  "title": "Brew93 Integration",
+  "standard": "Yes",
+  "roles": [{"role": "System Manager"}]
+}

@@ -1,0 +1,62 @@
+{% extends "templates/web.html" %}
+
+{% block title %}{{ _("Sign in with Brew93") }}{% endblock %}
+{% block navbar %}{% endblock %}
+
+{% block page_content %}
+<div class="brew93-login-wrap">
+    <div class="brew93-login-card">
+        <h1 class="brew93-login-title">{{ _("Sign in with Brew93") }}</h1>
+        <div class="brew93-login-error" role="alert" hidden></div>
+        <form class="brew93-login-form" autocomplete="on" novalidate>
+            <div class="form-group">
+                <label class="form-label" for="brew93_email">{{ _("Email") }}</label>
+                <input type="email" id="brew93_email" name="email" class="form-control" autocomplete="username" required autofocus>
+            </div>
+            <div class="form-group">
+                <label class="form-label" for="brew93_password">{{ _("Password") }}</label>
+                <input type="password" id="brew93_password" name="password" class="form-control" autocomplete="current-password" required>
+            </div>
+            <button type="submit" class="btn btn-primary btn-block brew93-signin-btn">{{ _("Sign In") }}</button>
+        </form>
+        <div class="brew93-login-alt"><a href="/login">{{ _("Sign in with Frappe password instead") }}</a></div>
+    </div>
+</div>
+<style>
+    .brew93-login-wrap { display: flex; justify-content: center; padding: 48px 16px; }
+    .brew93-login-card { width: 100%; max-width: 380px; background: var(--card-bg, #fff); border: 1px solid var(--border-color, #e2e2e2); border-radius: var(--border-radius-md, 8px); padding: 28px 28px 24px; }
+    .brew93-login-title { font-size: 20px; font-weight: 600; margin: 0 0 20px; text-align: center; }
+    .brew93-login-error { background: var(--red-50, #fdf1f1); color: var(--red-600, #c0392b); border-radius: var(--border-radius, 6px); padding: 10px 12px; margin-bottom: 16px; font-size: 13px; }
+    .brew93-login-alt { margin-top: 18px; text-align: center; font-size: 13px; }
+    .brew93-signin-btn { margin-top: 4px; }
+</style>
+<script>
+frappe.ready(function () {
+    const form = document.querySelector(".brew93-login-form");
+    const error = document.querySelector(".brew93-login-error");
+    const button = document.querySelector(".brew93-signin-btn");
+    function show_error(message) { error.textContent = message; error.hidden = false; }
+    form.addEventListener("submit", function (event) {
+        event.preventDefault();
+        error.hidden = true;
+        const email = form.email.value.trim();
+        const password = form.password.value;
+        if (!email || !password) return show_error(__("Enter your Brew93 email and password."));
+        button.disabled = true;
+        button.textContent = __("Signing in...");
+        frappe.call({
+            method: "brew93_connector.api.sso.login",
+            type: "POST",
+            args: { email: email, password: password },
+            callback: function (r) {
+                const result = (r && r.message) || {};
+                if (result.success) window.location.href = result.redirect_to || "/app";
+                else show_error(__("Sign in failed. Please try again."));
+            },
+            error: function () { show_error(__("Sign in failed. Please check your credentials and try again.")); },
+            always: function () { form.password.value = ""; button.disabled = false; button.textContent = __("Sign In"); }
+        });
+    });
+});
+</script>
+{% endblock %}
