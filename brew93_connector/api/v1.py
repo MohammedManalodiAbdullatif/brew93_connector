@@ -422,6 +422,26 @@ def _apply_customer(brew93_id, tenant_id, brew93_modified, data):
     return doc.name, action
 
 
+def _apply_quotation_items(doc, items):
+    """Replace Quotation Item child rows from a validated items list.
+
+    Only allow-listed scalar keys are copied; unknown keys are ignored the same
+    way top-level fields are. Totals are left to ERPNext's calculate_taxes.
+    """
+    if not isinstance(items, list):
+        return
+    allowed = {"item_code", "item_name", "description", "qty", "rate", "amount", "uom"}
+    doc.set("items", [])
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        row = {k: raw[k] for k in allowed if k in raw}
+        if not row.get("qty") and not row.get("rate") and not row.get("amount"):
+            continue
+        row.setdefault("qty", 1)
+        doc.append("items", row)
+
+
 def _apply_quotation(brew93_id, tenant_id, brew93_modified, data):
     existing = _existing_name("Quotation", brew93_id, tenant_id)
     doc = frappe.get_doc("Quotation", existing) if existing else frappe.new_doc("Quotation")
@@ -446,6 +466,8 @@ def _apply_quotation(brew93_id, tenant_id, brew93_modified, data):
     for field in ALLOWED_QUOTATION_FIELDS:
         if field in data:
             doc.set(field, data[field])
+    if "items" in data:
+        _apply_quotation_items(doc, data["items"])
     doc.brew93_id = brew93_id
     doc.brew93_tenant_id = tenant_id
     doc.brew93_synced_at = brew93_modified or frappe.utils.now()
