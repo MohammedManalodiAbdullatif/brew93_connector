@@ -11,4 +11,4 @@ INTEGRATION_ROLE = "Brew93 Integration"
 
 # DocTypes the integration role may touch (create/read/write only; no delete,
 # no submit, no privileged doctypes).
-INTEGRATION_DOCTYPES = ("Lead", "Opportunity", "Customer", "Contact")
+INTEGRATION_DOCTYPES = ("Lead", "Opportunity", "Customer", "Contact", "Quotation")
