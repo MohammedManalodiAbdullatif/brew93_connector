@@ -151,6 +151,19 @@ def _map_lead_status(value):
     return None  # unknown -> leave the field untouched
 
 
+def _synced_at(brew93_modified):
+    """Normalize inbound ISO-8601 timestamps to a MariaDB-safe naive datetime."""
+    if not brew93_modified:
+        return frappe.utils.now()
+    try:
+        dt = get_datetime(brew93_modified)
+        if getattr(dt, "tzinfo", None) is not None:
+            dt = dt.replace(tzinfo=None)
+        return dt
+    except Exception:
+        return frappe.utils.now()
+
+
 def _apply_lead(brew93_id, tenant_id, brew93_modified, data):
     existing = _existing_name("Lead", brew93_id, tenant_id)
     doc = frappe.get_doc("Lead", existing) if existing else frappe.new_doc("Lead")
@@ -158,7 +171,7 @@ def _apply_lead(brew93_id, tenant_id, brew93_modified, data):
     # Optional last-write-wins guard: skip if our copy is already newer.
     if existing and brew93_modified and doc.get("brew93_synced_at"):
         try:
-            if get_datetime(doc.brew93_synced_at) >= get_datetime(brew93_modified):
+            if _synced_at(doc.get("brew93_synced_at")) >= _synced_at(brew93_modified):
                 return doc.name, "unchanged"
         except Exception:
             pass
@@ -179,7 +192,7 @@ def _apply_lead(brew93_id, tenant_id, brew93_modified, data):
 
     doc.brew93_id = brew93_id
     doc.brew93_tenant_id = tenant_id
-    doc.brew93_synced_at = brew93_modified or frappe.utils.now()
+    doc.brew93_synced_at = _synced_at(brew93_modified)
 
     frappe.flags.in_brew93_import = True
     try:
@@ -219,7 +232,7 @@ def _apply_opportunity(brew93_id, tenant_id, brew93_modified, data):
 
     if existing and brew93_modified and doc.get("brew93_synced_at"):
         try:
-            if get_datetime(doc.brew93_synced_at) >= get_datetime(brew93_modified):
+            if _synced_at(doc.get("brew93_synced_at")) >= _synced_at(brew93_modified):
                 return doc.name, "unchanged"
         except Exception:
             pass
@@ -244,7 +257,7 @@ def _apply_opportunity(brew93_id, tenant_id, brew93_modified, data):
         if not company:
             raise _ApiError("no_company", "No company configured for the Opportunity.")
         doc.company = company
-        doc.transaction_date = data.get("transaction_date") or brew93_modified or frappe.utils.today()
+        doc.transaction_date = data.get("transaction_date") or (get_datetime(brew93_modified).date() if brew93_modified else frappe.utils.today())
 
     for field in ALLOWED_OPPORTUNITY_FIELDS:
         if field in data:
@@ -264,7 +277,7 @@ def _apply_opportunity(brew93_id, tenant_id, brew93_modified, data):
 
     doc.brew93_id = brew93_id
     doc.brew93_tenant_id = tenant_id
-    doc.brew93_synced_at = brew93_modified or frappe.utils.now()
+    doc.brew93_synced_at = _synced_at(brew93_modified)
 
     frappe.flags.in_brew93_import = True
     try:
@@ -307,7 +320,7 @@ def _apply_contact(brew93_id, tenant_id, brew93_modified, data):
 
     if existing and brew93_modified and doc.get("brew93_synced_at"):
         try:
-            if get_datetime(doc.brew93_synced_at) >= get_datetime(brew93_modified):
+            if _synced_at(doc.get("brew93_synced_at")) >= _synced_at(brew93_modified):
                 return doc.name, "unchanged"
         except Exception:
             pass
@@ -336,7 +349,7 @@ def _apply_contact(brew93_id, tenant_id, brew93_modified, data):
 
     doc.brew93_id = brew93_id
     doc.brew93_tenant_id = tenant_id
-    doc.brew93_synced_at = brew93_modified or frappe.utils.now()
+    doc.brew93_synced_at = _synced_at(brew93_modified)
 
     frappe.flags.in_brew93_import = True
     try:
@@ -374,7 +387,7 @@ def _apply_customer(brew93_id, tenant_id, brew93_modified, data):
 
     if existing and brew93_modified and doc.get("brew93_synced_at"):
         try:
-            if get_datetime(doc.brew93_synced_at) >= get_datetime(brew93_modified):
+            if _synced_at(doc.get("brew93_synced_at")) >= _synced_at(brew93_modified):
                 return doc.name, "unchanged"
         except Exception:
             pass
@@ -407,7 +420,7 @@ def _apply_customer(brew93_id, tenant_id, brew93_modified, data):
 
     doc.brew93_id = brew93_id
     doc.brew93_tenant_id = tenant_id
-    doc.brew93_synced_at = brew93_modified or frappe.utils.now()
+    doc.brew93_synced_at = _synced_at(brew93_modified)
 
     frappe.flags.in_brew93_import = True
     try:
@@ -448,7 +461,7 @@ def _apply_quotation(brew93_id, tenant_id, brew93_modified, data):
 
     if existing and brew93_modified and doc.get("brew93_synced_at"):
         try:
-            if get_datetime(doc.brew93_synced_at) >= get_datetime(brew93_modified):
+            if _synced_at(doc.get("brew93_synced_at")) >= _synced_at(brew93_modified):
                 return doc.name, "unchanged"
         except Exception:
             pass
@@ -470,7 +483,7 @@ def _apply_quotation(brew93_id, tenant_id, brew93_modified, data):
         _apply_quotation_items(doc, data["items"])
     doc.brew93_id = brew93_id
     doc.brew93_tenant_id = tenant_id
-    doc.brew93_synced_at = brew93_modified or frappe.utils.now()
+    doc.brew93_synced_at = _synced_at(brew93_modified)
 
     frappe.flags.in_brew93_import = True
     try:
