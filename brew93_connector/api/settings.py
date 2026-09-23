@@ -161,6 +161,9 @@ def set_workspace_refresh_token(refresh_token: str) -> None:
         raise ValueError("A workspace refresh token is required")
     doc = _doc()
     set_encrypted_password(SETTINGS_DOCTYPE, doc.name, refresh_token, "brew93_refresh_token")
+    # Console/scheduler contexts may not auto-commit; a lost rotation write
+    # leaves a server-side-revoked token and breaks all further refreshes.
+    frappe.db.commit()
 
 
 def get_hmac_secret() -> str | None:
@@ -186,6 +189,7 @@ def set_user_refresh_token(user: str, refresh_token: str) -> None:
     if not frappe.get_meta("User").has_field("brew93_refresh_token"):
         return
     set_encrypted_password("User", user, refresh_token, "brew93_refresh_token")
+    frappe.db.commit()
 
 
 def get_user_connection(user: str) -> dict | None:

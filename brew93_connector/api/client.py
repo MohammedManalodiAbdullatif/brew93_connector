@@ -385,6 +385,38 @@ def crm_delete_lead(brew93_id: str, user: str | None = None) -> Result:
     return _crm_request("delete", brew93_id, user=user)
 
 
+def _read_refresh_token(token_owner: str, user: str | None) -> str | None:
+    if token_owner == "workspace":
+        return cfg.get_workspace_refresh_token()
+    return cfg.get_user_refresh_token(user or token_owner)
+
+
+def _store_refresh_token(token_owner: str, user: str | None, refresh_token: str) -> None:
+    if token_owner == "workspace":
+        cfg.set_workspace_refresh_token(refresh_token)
+    else:
+        cfg.set_user_refresh_token(user or token_owner, refresh_token)
+
+
+def _do_refresh(session, values, token_owner, user, refresh_token):
+    slug = values.get("brew93_tenant_slug")
+    body = {"refresh_token": refresh_token}
+    if slug:
+        body.update(tenant_slug=slug, workspace_slug=slug)
+    headers = {"x-tenant-slug": slug} if slug else {}
+    try:
+        resp = session.post(values["brew93_base_url"].rstrip("/") + "/auth/refresh", json=body,
+                            headers=headers, timeout=(5, values["request_timeout"]))
+    finally:
+        body = None
+    if resp.status_code >= 300:
+        return None
+    data = _token_data(resp.json() or {})
+    if data.get("refresh_token") and data["refresh_token"] != refresh_token:
+        _store_refresh_token(token_owner, user, data["refresh_token"])
+    return data
+
+
 def _get_user_crm_token(values: dict, user: str | None, force: bool = False) -> str:
     _require_https(values.get("brew93_base_url"))
     refresh = cfg.get_user_refresh_token(user) if user else None
@@ -398,24 +430,45 @@ def _get_user_crm_token(values: dict, user: str | None, force: bool = False) -> 
     key = _scoped_cache_key(_user_token_cache_key(token_owner), values)
     if not force and (cached := frappe.cache().get_value(key)):
         return cached
+    lock_key = f"brew93:refresh-lock:{token_owner}"
+    got_lock = frappe.cache().get_value(lock_key)
+    if got_lock:
+        # Another worker is rotating; re-read and use its result if fresh.
+        import time
+        for _ in range(20):
+            time.sleep(0.25)
+            current = _read_refresh_token(token_owner, user)
+            cached = frappe.cache().get_value(key)
+            if cached:
+                return cached
+            if current and current != refresh:
+                refresh = current
+                break
+        else:
+            current = _read_refresh_token(token_owner, user)
+            if current:
+                refresh = current
+    frappe.cache().set_value(lock_key, 1, expires_in_sec=30)
     session = _session()
     try:
-        slug = values.get("brew93_tenant_slug")
-        body = {"refresh_token": refresh}
-        if slug:
-            body.update(tenant_slug=slug, workspace_slug=slug)
-        headers = {"x-tenant-slug": slug} if slug else {}
-        resp = session.post(values["brew93_base_url"].rstrip("/") + "/auth/refresh", json=body,
-                            headers=headers, timeout=(5, values["request_timeout"]))
-        if resp.status_code >= 300:
+        data = _do_refresh(session, values, token_owner, user, refresh)
+        if data is None:
+            # Concurrent worker may have rotated; re-read once before failing.
+            current = _read_refresh_token(token_owner, user)
+            if current and current != refresh:
+                refresh = current
+                data = _do_refresh(session, values, token_owner, user, refresh)
+        if data is None:
+            # Stale user token: fall back to workspace before giving up.
+            if token_owner != "workspace":
+                ws = cfg.get_workspace_refresh_token()
+                if ws:
+                    token_owner = "workspace"
+                    refresh = ws
+                    key = _scoped_cache_key(_user_token_cache_key(token_owner), values)
+                    data = _do_refresh(session, values, token_owner, user, refresh)
+        if data is None:
             raise Brew93ConfigError("Brew93 session refresh failed")
-        data = _token_data(resp.json() or {})
-        if data.get("refresh_token") and data["refresh_token"] != refresh:
-            if token_owner == "workspace":
-                cfg.set_workspace_refresh_token(data["refresh_token"])
-            else:
-                cfg.set_user_refresh_token(token_owner, data["refresh_token"])
-            refresh = data["refresh_token"]
         access_token = data["access_token"]
         claims = _verified_claims(access_token)
         _assert_tenant(claims, values.get("brew93_tenant_id"))
@@ -425,5 +478,5 @@ def _get_user_crm_token(values: dict, user: str | None, force: bool = False) -> 
             frappe.cache().set_value(key, data["access_token"], expires_in_sec=ttl)
         return data["access_token"]
     finally:
-        body = None
+        frappe.cache().delete_value(lock_key)
         session.close()

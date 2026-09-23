@@ -323,7 +323,10 @@ class TestSenderSignsExactBytes(unittest.TestCase):
             with self.assertRaises(client.Brew93ConfigError):
                 client._get_user_crm_token(values, "user@example.com")
         save.assert_called_once_with("user@example.com", "new")
-        cache.return_value.set_value.assert_not_called()
+        # Only the refresh lock may be written; the invalid access token must not be cached.
+        cached_keys = [c.args[0] for c in cache.return_value.set_value.call_args_list]
+        self.assertTrue(all(str(k).startswith("brew93:refresh-lock:") for k in cached_keys), cached_keys)
+        self.assertNotIn("invalid", [c.args[1] for c in cache.return_value.set_value.call_args_list if len(c.args) > 1])
 
     def test_auth_me_tenant_mismatch_fails_closed(self):
         session = MagicMock()
