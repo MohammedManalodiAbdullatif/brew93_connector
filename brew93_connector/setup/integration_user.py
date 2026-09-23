@@ -9,7 +9,12 @@ invoked only after explicit user approval (e.g. via bench execute). It creates:
 - read-only DocPerms on Item/UOM so Quotation line link validation works,
 - a System User `brew93-integration@rag.klyonix.in` holding ONLY that role.
 
-It does NOT generate or print API keys — that is a separate, explicit step so no
+IMPORTANT: Frappe\u0027s meta.set_custom_permissions() REPLACES meta.permissions with
+Custom DocPerm rows whenever ANY Custom DocPerm exists for a DocType. Before the
+first Custom DocPerm is inserted, every standard DocPerm row must be copied over,
+or roles like Sales User silently lose desk permissions (breaking SSO eligibility).
+
+It does NOT generate or print API keys \u2014 that is a separate, explicit step so no
 secret is ever emitted to a log or a message.
 """
 
@@ -54,7 +59,48 @@ def ensure_integration_identity():
     return {"role": INTEGRATION_ROLE, "user": INTEGRATION_USER}
 
 
+def repair_custom_docperms(doctypes=None):
+    """Copy any missing standard DocPerm rows into Custom DocPerm.
+
+    Safe to re-run: only inserts (parent, role, permlevel) combos that are not
+    already present in Custom DocPerm. Fixes sites where a partial Custom DocPerm
+    (ours only) wiped Sales User / Desk User permissions from meta.permissions.
+    """
+    doctypes = list(doctypes or set(INTEGRATION_DOCTYPES) | set(READ_ONLY_DOCTYPES))
+    copied = 0
+    for dt in doctypes:
+        std = frappe.get_all(
+            "DocPerm",
+            filters={"parent": dt},
+            fields=["role", "permlevel", "select", "read", "write", "create", "delete",
+                    "submit", "cancel", "amend", "print", "email", "report", "export",
+                    "import", "share", "if_owner"],
+        )
+        for row in std:
+            exists = frappe.db.exists(
+                "Custom DocPerm",
+                {"parent": dt, "role": row.role, "permlevel": row.permlevel, "if_owner": row.get("if_owner") or 0},
+            )
+            if exists:
+                continue
+            perm = frappe.new_doc("Custom DocPerm")
+            perm.parent = dt
+            perm.parenttype = "DocType"
+            perm.parentfield = "permissions"
+            perm.update(row)
+            perm.insert(ignore_permissions=True)
+            copied += 1
+    frappe.db.commit()
+    frappe.clear_cache(doctype="Lead")
+    for dt in doctypes:
+        frappe.clear_cache(doctype=dt)
+    return {"copied": copied, "doctypes": doctypes}
+
+
 def _ensure_docperm(doctype, write=True):
+    # Preserve standard role permissions before/while adding ours (see module docstring).
+    repair_custom_docperms([doctype])
+
     exists = frappe.db.exists(
         "Custom DocPerm", {"parent": doctype, "role": INTEGRATION_ROLE, "permlevel": 0}
     )
@@ -68,6 +114,7 @@ def _ensure_docperm(doctype, write=True):
                 perm.save(ignore_permissions=True)
                 frappe.db.commit()
         return
+
     perm = frappe.new_doc("Custom DocPerm")
     perm.parent = doctype
     perm.parenttype = "DocType"
