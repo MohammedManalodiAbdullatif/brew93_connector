@@ -19,6 +19,7 @@ Run: bench --site <site> run-tests --module brew93_connector.tests.test_live_flo
 """
 
 import http.server
+import hmac
 import json
 import threading
 import uuid
@@ -38,10 +39,11 @@ QUEUE = "Brew93 Event Queue"
 class _Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
-        ok, reason = signing.verify_signature(
-            self.server.secret, raw,
-            self.headers.get(signing.HEADER_TIMESTAMP), self.headers.get(signing.HEADER_SIGNATURE),
-        )
+        timestamp = self.headers.get(signing.HEADER_TIMESTAMP)
+        version, _, provided = (self.headers.get(signing.HEADER_SIGNATURE) or "").partition("=")
+        expected = signing.compute_signature(self.server.secret, int(timestamp), raw) if timestamp else ""
+        ok = version == signing.SIGNATURE_VERSION and hmac.compare_digest(expected, provided)
+        reason = "ok" if ok else "signature_mismatch"
         self.server.received.append({
             "sig_ok": ok, "reason": reason, "body": json.loads(raw),
             "event_id_header": self.headers.get(signing.HEADER_EVENT_ID),
@@ -84,7 +86,7 @@ class TestLiveLeadFlow(FrappeTestCase):
             "enabled": True, "events_enabled": True, "source_site": "rag.klyonix.in",
             "brew93_base_url": "http://127.0.0.1/api/v1", "events_url": self.events_url,
             "brew93_tenant_id": TENANT, "request_timeout": 5, "max_retries": 3,
-            "retry_backoff_base": 2.0, "max_backoff_seconds": 3600, "replay_window_seconds": 300,
+            "retry_backoff_base": 2.0, "max_backoff_seconds": 3600,
         }
         self.enabled = True
         p = patch.multiple(

@@ -4,9 +4,7 @@
 Endpoints used (all documented in the Brew93 Postman collection except the
 events receiver, which is marked NEW in the contract):
 
-  POST   {base}/integrations/erpnext/auth/login          (service login -> JWT)
-  POST   {base}/integrations/erpnext/{resource}/bulk      (bulk upsert, <=500)
-  DELETE {base}/integrations/erpnext/{resource}/{extid}?source_site=...
+  POST   {base}/auth/login                                (workspace login -> JWT)
   POST   {events_url}                                     (NEW: HMAC-signed events)
 
 The client performs a SINGLE attempt and classifies the outcome; retry/backoff
@@ -28,8 +26,6 @@ import frappe
 from brew93_connector.api import settings as cfg
 from brew93_connector.api import signing
 
-BULK_MAX_RECORDS = 500
-_TOKEN_CACHE_KEY = "brew93_connector:service_token"
 _CRM_TOKEN_CACHE_KEY = "brew93_connector:crm_token"
 
 
@@ -43,11 +39,6 @@ class Result:
     failure_kind: str | None
     body: dict | None
     message: str = ""
-
-    @property
-    def retryable(self) -> bool:
-        return self.failure_kind == "temporary"
-
 
 class Brew93ConfigError(Exception):
     pass
@@ -75,53 +66,12 @@ def _jwt_ttl(claims: dict, default: int = 600) -> int:
         return 0
 
 
-def _login(session: requests.Session, values: dict) -> str:
-    """Service login -> access token. Password is spent once and dropped."""
-    _require_https(values.get("brew93_base_url"))
-    password = cfg.get_service_password()
-    if not values.get("brew93_base_url") or not values.get("service_email") or not password:
-        raise Brew93ConfigError("Brew93 service credentials are not fully configured")
-
-    payload = {
-        "email": values["service_email"],
-        "password": password,
-        "workspace_slug": values.get("brew93_tenant_slug") or values.get("source_site"),
-    }
-    # The documented service login takes workspace_slug; the tenant is pinned by
-    # verifying the returned token's tenant_id below.
-    url = values["brew93_base_url"] + "/integrations/erpnext/auth/login"
-    resp = session.post(url, json=payload, timeout=(5, values["request_timeout"]))
-    payload.clear()
-    if resp.status_code >= 300:
-        raise Brew93ConfigError(f"Brew93 service login failed (HTTP {resp.status_code})")
-    data = _token_data(resp.json() or {})
-    token = data["access_token"]
-    claims = _verified_claims(token)
-    _assert_tenant(claims, values.get("brew93_tenant_id"))
-    _validate_remote_identity(session, values, token, claims)
-    return token
-
-
 def _assert_tenant(claims: dict, expected_tenant_id: str | None) -> None:
     """Refuse to use a token whose tenant_id != the pinned tenant."""
     if not expected_tenant_id:
         return
     if str(claims.get("tenant_id")) != str(expected_tenant_id):
         raise Brew93ConfigError("Brew93 token tenant_id does not match the pinned tenant; refusing")
-
-
-def _get_token(session: requests.Session, values: dict, force: bool = False) -> str:
-    key = _scoped_cache_key(_TOKEN_CACHE_KEY, values)
-    if not force:
-        cached = frappe.cache().get_value(key)
-        if cached:
-            return cached
-    token = _login(session, values)
-    claims = _verified_claims(token)
-    ttl = _jwt_ttl(claims)
-    if ttl:
-        frappe.cache().set_value(key, token, expires_in_sec=ttl)
-    return token
 
 
 def _classify(resp: requests.Response) -> Result:
@@ -138,109 +88,6 @@ def _classify(resp: requests.Response) -> Result:
 
 
 # --- public operations -----------------------------------------------------
-def bulk_upsert(resource: str, records: list[dict]) -> Result:
-    values = cfg.get_settings()
-    if len(records) > BULK_MAX_RECORDS:
-        raise ValueError(f"bulk_upsert accepts at most {BULK_MAX_RECORDS} records")
-    session = _session()
-    try:
-        token = _get_token(session, values)
-        url = f"{values['brew93_base_url']}/integrations/erpnext/{resource}/bulk"
-        payload = {"source_site": values["source_site"], "records": records}
-        try:
-            resp = session.post(
-                url,
-                json=payload,
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=(5, values["request_timeout"]),
-            )
-        except requests.exceptions.RequestException as exc:
-            return Result(False, None, "temporary", None, exc.__class__.__name__)
-        if resp.status_code in (401, 403):
-            # token may have expired between cache set and use; retry once fresh
-            token = _get_token(session, values, force=True)
-            resp = session.post(
-                url,
-                json=payload,
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=(5, values["request_timeout"]),
-            )
-        return _classify(resp)
-    finally:
-        session.close()
-
-
-def delete(resource: str, external_id: str) -> Result:
-    values = cfg.get_settings()
-    session = _session()
-    try:
-        token = _get_token(session, values)
-        url = f"{values['brew93_base_url']}/integrations/erpnext/{resource}/{external_id}"
-        try:
-            resp = session.delete(
-                url,
-                params={"source_site": values["source_site"]},
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=(5, values["request_timeout"]),
-            )
-        except requests.exceptions.RequestException as exc:
-            return Result(False, None, "temporary", None, exc.__class__.__name__)
-        return _classify(resp)
-    finally:
-        session.close()
-
-
-def brew93_user_login(base_url: str, email: str, password: str, workspace: str | None) -> dict:
-    """Authenticate a human against Brew93's user login and return the JWT claims.
-
-    Used by the hardened SSO. Posts to {base_url}/auth/login (the USER login, not
-    the integration service login). The password is forwarded once; the token is
-    decoded for its claims and then discarded. Never logs credentials or tokens.
-    """
-    _require_https(base_url)
-    payload = {"email": email, "password": password}
-    headers = {}
-    if workspace:
-        # Live Brew93 contract (Postman) selects the workspace by `tenant_slug`
-        # in the body AND the `x-tenant-slug` header; `workspace_slug` kept for
-        # backward-compatibility with older gateways.
-        payload["tenant_slug"] = workspace
-        payload["workspace_slug"] = workspace
-        headers["x-tenant-slug"] = workspace
-    session = _session()
-    try:
-        try:
-            resp = session.post(base_url.rstrip("/") + "/auth/login", json=payload,
-                                headers=headers, timeout=(5, 10))
-        except requests.exceptions.RequestException:
-            frappe.throw(frappe._("Brew93 is unavailable right now. Please try again."))
-        finally:
-            payload.clear()
-        if resp.status_code in (400, 401, 403):
-            frappe.throw(frappe._("Invalid Brew93 email or password."), frappe.AuthenticationError)
-        if resp.status_code >= 300:
-            frappe.throw(frappe._("Brew93 rejected the sign-in (HTTP {0}).").format(resp.status_code))
-        data = _token_data(resp.json() or {})
-        token = data["access_token"]
-        claims = _verified_claims(token)
-        _validate_remote_identity(session, {"brew93_base_url": base_url, "brew93_tenant_slug": workspace,
-                                            "brew93_tenant_id": None, "request_timeout": 10}, token, claims)
-        return claims
-    finally:
-        session.close()
-
-
-def get_profile_from_token(access_token: str) -> dict:
-    """Decode a Brew93 JWT's payload (claims) without verifying the signature.
-
-    Safe here because the token was just obtained over TLS directly from Brew93;
-    we read tenant_id/sub/email/email_verified to authorize the SSO mapping.
-    """
-    payload_b64 = access_token.split(".")[1]
-    payload_b64 += "=" * ((4 - len(payload_b64) % 4) % 4)
-    return json.loads(base64.urlsafe_b64decode(payload_b64.encode()).decode())
-
-
 def brew93_user_authenticate(values: dict, email: str, password: str) -> dict:
     """Return verified claims and the refresh token for immediate encrypted storage."""
     result = _user_login(values, email, password)

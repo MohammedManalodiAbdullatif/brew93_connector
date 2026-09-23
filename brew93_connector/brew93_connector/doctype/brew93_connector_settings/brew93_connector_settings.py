@@ -5,7 +5,6 @@ from frappe.model.document import Document
 
 class Brew93ConnectorSettings(Document):
     def validate(self):
-        self.sso_auto_create = 0
         for field in ("brew93_base_url", "events_url"):
             if self.get(field):
                 self.set(field, (self.get(field) or "").strip().rstrip("/"))

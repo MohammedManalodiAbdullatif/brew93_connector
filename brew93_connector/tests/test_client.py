@@ -32,17 +32,6 @@ class _Resp:
 
 
 class TestSenderSignsExactBytes(unittest.TestCase):
-    def test_http_service_login_rejects_before_post_or_password_use(self):
-        session = MagicMock()
-        with patch.object(client.cfg, "get_service_password") as get_password:
-            with self.assertRaisesRegex(client.Brew93ConfigError, "HTTPS"):
-                client._login(session, {"brew93_base_url": "http://example.invalid",
-                                        "service_email": "service@example.invalid",
-                                        "request_timeout": 5})
-        session.post.assert_not_called()
-        get_password.assert_not_called()
-        self.assertNotIn("service-password", repr(session.mock_calls))
-
     def test_http_user_login_rejects_before_session_or_password_use(self):
         session = MagicMock()
         with patch.object(client, "_session", return_value=session) as make_session, \
@@ -75,15 +64,6 @@ class TestSenderSignsExactBytes(unittest.TestCase):
         make_session.assert_not_called()
         get_refresh.assert_not_called()
         self.assertNotIn("refresh-secret", repr(session.mock_calls))
-
-    def test_http_public_user_login_rejects_before_session(self):
-        session = MagicMock()
-        with patch.object(client, "_session", return_value=session) as make_session:
-            with self.assertRaisesRegex(client.Brew93ConfigError, "HTTPS"):
-                client.brew93_user_login("http://example.invalid", "user@example.invalid",
-                                         "login-password", None)
-        make_session.assert_not_called()
-        self.assertNotIn("login-password", repr(session.mock_calls))
 
     def test_jwt_claims_fail_closed_without_trust_key(self):
         def token(header, claims):
@@ -272,42 +252,6 @@ class TestSenderSignsExactBytes(unittest.TestCase):
             cfgm.get_hmac_secret.return_value = None
             with self.assertRaises(client.Brew93ConfigError):
                 client.post_event("{}", "e2")
-
-    def test_outbound_token_does_not_read_legacy_connection_token(self):
-        session = MagicMock()
-        with patch.object(client, "cfg") as cfgm, patch.object(client.frappe, "cache") as cache:
-            cfgm.get_service_password.return_value = "service-secret"
-            cfgm.get_connection_token.side_effect = AssertionError("legacy token must not be read")
-            cache.return_value.get_value.return_value = None
-            cache.return_value.set_value.return_value = None
-            response = MagicMock(status_code=200)
-            response.json.return_value = {"data": {"access_token": "jwt", "expires_in": 600, "token_type": "Bearer"}}
-            session.post.return_value = response
-            me = MagicMock(status_code=200)
-            me.json.return_value = {"data": {"sub": "service", "tenant_id": "tenant"}}
-            session.get.return_value = me
-            values = {
-                "brew93_base_url": "https://example.invalid/api/v1",
-                "service_email": "sync@example.invalid",
-                "source_site": "test.local",
-                "request_timeout": 5,
-            }
-            with patch.object(client, "_verified_claims", return_value={"tenant_id": "tenant", "exp": 4100752000, "sub": "service"}), \
-                 patch.object(client, "_assert_tenant"), patch.object(client, "_validate_remote_identity"):
-                self.assertEqual(client._get_token(session, values), "jwt")
-
-    def test_service_login_rejects_invalid_signature_before_tenant_check(self):
-        session = MagicMock()
-        response = MagicMock(status_code=200)
-        response.json.return_value = {"data": {"access_token": "invalid", "expires_in": 600, "token_type": "Bearer"}}
-        session.post.return_value = response
-        values = {"brew93_base_url": URL, "service_email": "service@example.invalid", "request_timeout": 5}
-        with patch.object(client.cfg, "get_service_password", return_value="password"), \
-             patch.object(client, "_verified_claims", side_effect=client.Brew93ConfigError("Invalid Brew93 JWT")), \
-             patch.object(client, "_assert_tenant") as assert_tenant:
-            with self.assertRaises(client.Brew93ConfigError):
-                client._login(session, values)
-        assert_tenant.assert_not_called()
 
     def test_crm_login_rejects_invalid_signature_before_tenant_check(self):
         session = MagicMock()

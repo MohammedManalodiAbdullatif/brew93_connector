@@ -76,38 +76,3 @@ def build_signed_headers(
         HEADER_SIGNATURE: f"{SIGNATURE_VERSION}={sig}",
         HEADER_EVENT_ID: event_id,
     }
-
-
-def verify_signature(
-    secret: str,
-    raw_body: str | bytes,
-    timestamp_header: str,
-    signature_header: str,
-    replay_window_seconds: int = 300,
-    now: int | None = None,
-) -> tuple[bool, str]:
-    """Verify an inbound signed request (used by the inbound receiver + tests).
-
-    Returns ``(ok, reason)``. On failure `reason` is a short machine-stable code:
-    ``bad_timestamp`` | ``expired`` | ``bad_signature_format`` | ``signature_mismatch``.
-    Uses constant-time comparison. Never logs the secret or the signature.
-    """
-    try:
-        ts = int(timestamp_header)
-    except (TypeError, ValueError):
-        return False, "bad_timestamp"
-
-    current = int(time.time()) if now is None else int(now)
-    if abs(current - ts) > int(replay_window_seconds):
-        return False, "expired"
-
-    if not signature_header or "=" not in signature_header:
-        return False, "bad_signature_format"
-    version, _, provided = signature_header.partition("=")
-    if version != SIGNATURE_VERSION or not provided:
-        return False, "bad_signature_format"
-
-    expected = compute_signature(secret, ts, raw_body)
-    if not hmac.compare_digest(expected, provided.strip().lower()):
-        return False, "signature_mismatch"
-    return True, "ok"

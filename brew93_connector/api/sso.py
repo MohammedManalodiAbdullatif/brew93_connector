@@ -20,8 +20,6 @@ The password is forwarded to Brew93 once and never stored or logged.
 
 from __future__ import annotations
 
-import hashlib
-
 import frappe
 from frappe import _
 from frappe.rate_limiter import rate_limit
@@ -154,45 +152,3 @@ def _set_user_connection_metadata(user: str, tenant_id: str) -> None:
         values["brew93_connection_status"] = "Connected"
     if values:
         frappe.db.set_value("User", user, values)
-
-
-def _create_user(claims: dict, values: dict) -> str:
-    default_role = values.get("sso_default_role")
-    if default_role in _PRIVILEGED_ROLES:
-        frappe.throw(_("SSO default role must not be privileged."), frappe.AuthenticationError)
-
-    email = (claims.get("email") or "").strip().lower()
-    doc = frappe.new_doc("User")
-    doc.update({
-        "email": email,
-        "username": _unique_username(email),
-        "first_name": claims.get("first_name") or (email.split("@")[0] if email else "Brew93 User"),
-        "last_name": claims.get("last_name") or "",
-        "enabled": 1,
-        "user_type": "System User",
-        "send_welcome_email": 0,
-    })
-    if frappe.get_meta("User").has_field("brew93_user_id"):
-        doc.brew93_user_id = claims.get("sub")
-    if default_role and frappe.db.exists("Role", default_role):
-        doc.append("roles", {"role": default_role})
-    doc.flags.ignore_permissions = True
-    doc.insert(ignore_permissions=True)
-    frappe.db.commit()  # nosemgrep - the session below must see a committed user
-    return doc.name
-
-
-def _unique_username(email: str) -> str:
-    """Use the stable email identity instead of Frappe's first-name default."""
-    if email and not frappe.db.exists("User", {"username": email}):
-        return email
-
-    # Keep the fallback deterministic and independent of the user's display name.
-    digest = hashlib.sha256(email.encode()).hexdigest()[:16]
-    base = frappe.scrub(email.replace("@", " ")) or "brew93_user"
-    username = f"{base}_{digest}"
-    suffix = 1
-    while frappe.db.exists("User", {"username": username}):
-        username = f"{base}_{digest}_{suffix}"
-        suffix += 1
-    return username

@@ -23,8 +23,6 @@ VALUES = {
     "brew93_base_url": "https://example.invalid/api/v1",
     "brew93_tenant_id": TENANT,
     "brew93_tenant_slug": "kly",
-    "sso_auto_create": False,
-    "sso_default_role": None,
 }
 
 
@@ -41,6 +39,7 @@ def _mk_user(roles=None, brew93_user_id=None, user_type="System User"):
         d.append("roles", {"role": r})
     d.flags.ignore_permissions = True
     d.insert(ignore_permissions=True)
+    frappe.db.set_value("User", d.name, "user_type", user_type)
     return d.name
 
 
@@ -84,20 +83,6 @@ class TestSSOGuards(FrappeTestCase):
     def test_unknown_user_autocreate_off_refused(self):
         with self.assertRaises(frappe.AuthenticationError):
             sso._resolve_user({"sub": str(uuid.uuid4()), "email": f"nobody-{uuid.uuid4().hex}@x.com"}, VALUES)
-
-    def test_autocreate_setting_is_ignored(self):
-        vals = dict(VALUES, sso_auto_create=True, sso_default_role="Sales User")
-        sub = str(uuid.uuid4())
-        email = f"sso-new-{uuid.uuid4().hex[:8]}@example.com"
-        with self.assertRaises(frappe.AuthenticationError):
-            sso._resolve_user({"sub": sub, "email": email, "first_name": MARKER}, vals)
-
-    def test_autocreate_setting_does_not_provision_on_username_collision(self):
-        vals = dict(VALUES, sso_auto_create=True, sso_default_role="Sales User")
-        with self.assertRaises(frappe.AuthenticationError):
-            sso._resolve_user(
-                {"sub": str(uuid.uuid4()), "email": f"sso-collision-{uuid.uuid4().hex[:8]}@example.com"}, vals
-            )
 
     def test_administrator_refused(self):
         with self.assertRaises(frappe.AuthenticationError):
@@ -211,7 +196,7 @@ class TestSSOGuards(FrappeTestCase):
             legacy_login.assert_not_called()
 
     # --- full login() flow with Brew93 mocked -------------------------------
-    def _login(self, claims, login_manager):
+    def _run_login(self, claims, login_manager):
         vals = dict(VALUES, brew93_tenant_slug="klyonix")
         with patch("brew93_connector.api.sso.cfg.sso_enabled", return_value=True), \
              patch("brew93_connector.api.sso.cfg.get_settings", return_value=vals), \
@@ -231,7 +216,7 @@ class TestSSOGuards(FrappeTestCase):
         sub = str(uuid.uuid4())
         user = _mk_user(roles=["Sales User"], brew93_user_id=sub)  # desk role => System User
         lm = MagicMock()
-        out = self._login({"sub": sub, "tenant_id": TENANT, "email": "whatever@example.com"}, lm)
+        out = self._run_login({"sub": sub, "tenant_id": TENANT, "email": "whatever@example.com"}, lm)
         self.assertEqual(out, {"success": True, "user": user, "redirect_to": "/app"})
         lm.login_as.assert_called_once_with(user)
 
@@ -251,7 +236,10 @@ class TestSSOGuards(FrappeTestCase):
         save.assert_called_once_with(user, "refresh-secret")
 
     def test_refresh_token_helper_uses_password_field_save(self):
-        with patch.object(settings, "set_encrypted_password") as set_password, \
+        meta = MagicMock()
+        meta.has_field.return_value = True
+        with patch.object(settings.frappe, "get_meta", return_value=meta), \
+             patch.object(settings, "set_encrypted_password") as set_password, \
              patch.object(settings.frappe, "get_doc") as get_doc:
             settings.set_user_refresh_token("user@example.com", "refresh-secret")
         set_password.assert_called_once_with(
@@ -271,12 +259,15 @@ class TestSSOGuards(FrappeTestCase):
         get_doc.assert_not_called()
 
     def test_connection_status_redacts_tokens(self):
-        with patch.object(settings.frappe, "get_settings", create=True), \
+        meta = MagicMock()
+        meta.has_field.return_value = True
+        with patch.object(settings.frappe, "get_meta", return_value=meta), \
+             patch.object(settings.frappe, "get_settings", create=True), \
              patch.object(settings, "get_settings", return_value={"brew93_tenant_id": TENANT}), \
              patch.object(settings.frappe.db, "get_value", return_value={
                  "brew93_tenant_id": TENANT, "brew93_connection_status": "Connected"
              }), patch.object(settings, "get_user_refresh_token", return_value="secret-refresh-token"):
-            with patch.object(settings.frappe.session, "user", "user@example.com"):
+            with patch.dict(settings.frappe.session, {"user": "user@example.com"}):
                 result = settings.get_connection_status()
         self.assertEqual(result, {"connected": True, "status": "Connected", "tenant_id": TENANT})
         self.assertNotIn("secret-refresh-token", result)
@@ -288,7 +279,7 @@ class TestSSOGuards(FrappeTestCase):
         _mk_user(brew93_user_id=sub)
         lm = MagicMock()
         with self.assertRaises(frappe.AuthenticationError):
-            self._login({"sub": sub, "tenant_id": "another-tenant", "email": "x@example.com"}, lm)
+            self._run_login({"sub": sub, "tenant_id": "another-tenant", "email": "x@example.com"}, lm)
         lm.login_as.assert_not_called()
 
     def test_login_refuses_system_manager_linked_by_id(self):
@@ -298,7 +289,7 @@ class TestSSOGuards(FrappeTestCase):
         _mk_user(roles=["System Manager"], brew93_user_id=sub)
         lm = MagicMock()
         with self.assertRaises(frappe.AuthenticationError):
-            self._login({"sub": sub, "tenant_id": TENANT, "email": "x@example.com"}, lm)
+            self._run_login({"sub": sub, "tenant_id": TENANT, "email": "x@example.com"}, lm)
         lm.login_as.assert_not_called()
 
     def test_login_refuses_administrator(self):
@@ -357,5 +348,5 @@ class TestSSOGuards(FrappeTestCase):
         frappe.db.set_value("User", user, "enabled", 0)
         lm = MagicMock()
         with self.assertRaises(frappe.AuthenticationError):
-            self._login({"sub": sub, "tenant_id": TENANT, "email": "x@example.com"}, lm)
+            self._run_login({"sub": sub, "tenant_id": TENANT, "email": "x@example.com"}, lm)
         lm.login_as.assert_not_called()

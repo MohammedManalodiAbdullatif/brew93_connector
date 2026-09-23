@@ -27,10 +27,7 @@ PUBLIC_FIELDS = (
     "max_backoff_seconds",
     "events_enabled",
     "events_url",
-    "replay_window_seconds",
     "sso_enabled",
-    "sso_auto_create",
-    "sso_default_role",
     "allow_service_fallback",
     "brew93_connection_status",
     "brew93_connected_user_id",
@@ -55,7 +52,6 @@ def get_settings() -> dict:
     values["max_retries"] = int(values.get("max_retries") or 5)
     values["retry_backoff_base"] = float(values.get("retry_backoff_base") or 2.0)
     values["max_backoff_seconds"] = int(values.get("max_backoff_seconds") or 3600)
-    values["replay_window_seconds"] = int(values.get("replay_window_seconds") or 300)
     return values
 
 
@@ -78,18 +74,6 @@ def sso_is_enabled_and_configured() -> bool:
     """Return whether the hardened connector SSO is ready for public login."""
     values = get_settings()
     return bool(values.get("sso_enabled") and values.get("brew93_base_url") and values.get("brew93_tenant_id"))
-
-
-@frappe.whitelist()
-def get_configuration() -> dict:
-    """Return connector settings safe for the System Manager setup page."""
-    frappe.only_for(("System Manager",))
-    values = get_settings()
-    return {
-        "settings": values,
-        "can_write": frappe.has_permission(SETTINGS_DOCTYPE, "write"),
-        "login_route": "/brew93-login",
-    }
 
 
 def _require_setup_admin() -> None:
@@ -140,7 +124,6 @@ def link_workspace(base_url, tenant_id, workspace_slug, username, password) -> d
         "brew93_connection_status": "Connected",
         "brew93_connected_user_id": claims.get("sub") or claims.get("user_id"),
         "brew93_connected_username": (claims.get("email") or username).strip().lower(),
-        "sso_auto_create": 0,
         "sso_enabled": 1,
     })
     set_encrypted_password(SETTINGS_DOCTYPE, doc.name, refresh_token, "brew93_refresh_token")

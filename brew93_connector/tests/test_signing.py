@@ -40,52 +40,6 @@ class TestSigning(unittest.TestCase):
         self.assertEqual(h[signing.HEADER_EVENT_ID], "evt-1")
         self.assertTrue(h[signing.HEADER_SIGNATURE].startswith("v1="))
 
-    def test_verify_roundtrip_ok(self):
-        body = '{"event_id":"e2"}'
-        h = signing.build_signed_headers(SECRET, body, "e2", timestamp=1700000000)
-        ok, reason = signing.verify_signature(
-            SECRET, body, h[signing.HEADER_TIMESTAMP], h[signing.HEADER_SIGNATURE], now=1700000010
-        )
-        self.assertTrue(ok)
-        self.assertEqual(reason, "ok")
-
-    def test_verify_expired(self):
-        body = "{}"
-        h = signing.build_signed_headers(SECRET, body, "e", timestamp=1700000000)
-        ok, reason = signing.verify_signature(
-            SECRET, body, h[signing.HEADER_TIMESTAMP], h[signing.HEADER_SIGNATURE],
-            replay_window_seconds=300, now=1700000600,
-        )
-        self.assertFalse(ok)
-        self.assertEqual(reason, "expired")
-
-    def test_verify_tampered_body(self):
-        h = signing.build_signed_headers(SECRET, '{"amount":1}', "e", timestamp=1700000000)
-        ok, reason = signing.verify_signature(
-            SECRET, '{"amount":9999}', h[signing.HEADER_TIMESTAMP], h[signing.HEADER_SIGNATURE], now=1700000010
-        )
-        self.assertFalse(ok)
-        self.assertEqual(reason, "signature_mismatch")
-
-    def test_verify_wrong_secret(self):
-        body = "{}"
-        h = signing.build_signed_headers(SECRET, body, "e", timestamp=1700000000)
-        ok, reason = signing.verify_signature(
-            "other-secret", body, h[signing.HEADER_TIMESTAMP], h[signing.HEADER_SIGNATURE], now=1700000010
-        )
-        self.assertFalse(ok)
-        self.assertEqual(reason, "signature_mismatch")
-
-    def test_verify_bad_format(self):
-        ok, reason = signing.verify_signature(SECRET, "{}", "1700000000", "deadbeef", now=1700000000)
-        self.assertFalse(ok)
-        self.assertEqual(reason, "bad_signature_format")
-
-    def test_verify_bad_timestamp(self):
-        ok, reason = signing.verify_signature(SECRET, "{}", "not-a-number", "v1=abc", now=1700000000)
-        self.assertFalse(ok)
-        self.assertEqual(reason, "bad_timestamp")
-
     def test_resign_changes_with_timestamp(self):
         body = "{}"
         s1 = signing.compute_signature(SECRET, 1700000000, body)

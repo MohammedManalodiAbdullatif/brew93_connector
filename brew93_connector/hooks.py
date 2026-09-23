@@ -63,11 +63,3 @@ scheduler_events = {
         ],
     },
 }
-
-# Fixtures: export the Custom Fields this app owns so installs are reproducible.
-fixtures = [
-    {
-        "dt": "Custom Field",
-        "filters": [["fieldname", "in", ["brew93_id", "brew93_tenant_id", "brew93_synced_at"]]],
-    }
-]
