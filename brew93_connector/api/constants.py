@@ -12,3 +12,7 @@ INTEGRATION_ROLE = "Brew93 Integration"
 # DocTypes the integration role may touch (create/read/write only; no delete,
 # no submit, no privileged doctypes).
 INTEGRATION_DOCTYPES = ("Lead", "Opportunity", "Customer", "Contact", "Quotation")
+
+# Link targets that inbound writes must validate (Quotation Item item_code/uom).
+# Read-only: the role never creates or edits master data.
+READ_ONLY_DOCTYPES = ("Item", "UOM")
