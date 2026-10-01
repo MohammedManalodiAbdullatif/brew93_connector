@@ -129,7 +129,7 @@ def _existing_name(doctype, brew93_id, tenant_id):
         if not row.brew93_tenant_id or str(row.brew93_tenant_id) == str(tenant_id):
             return row.name
     if rows:
-        return rows[0].name
+        raise _ApiError("tenant_mismatch", f"External ID belongs to another tenant.", 409)
     return None
 
 
@@ -776,14 +776,17 @@ def _handle(resource_apply, **kwargs):
         name, action = resource_apply(brew93_id, tenant_id, kwargs.get("brew93_modified"), data)
         return {"ok": True, "erpnext_name": name, "action": action}
     except _ApiError as e:
-        frappe.local.response["http_status_code"] = e.http
+        if getattr(frappe.local, "response", None) is not None:
+            frappe.local.response["http_status_code"] = e.http
         return {"ok": False, "error": {"code": e.code, "message": e.message}}
     except frappe.PermissionError:
-        frappe.local.response["http_status_code"] = 403
+        if getattr(frappe.local, "response", None) is not None:
+            frappe.local.response["http_status_code"] = 403
         return {"ok": False, "error": {"code": "forbidden", "message": "Permission denied."}}
     except Exception:
         frappe.log_error(title="brew93_connector: inbound upsert failed", message=frappe.get_traceback())
-        frappe.local.response["http_status_code"] = 500
+        if getattr(frappe.local, "response", None) is not None:
+            frappe.local.response["http_status_code"] = 500
         return {"ok": False, "error": {"code": "internal_error", "message": "Unexpected error."}}
 
 

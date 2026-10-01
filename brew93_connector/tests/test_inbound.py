@@ -27,37 +27,41 @@ class TestApplyLead(FrappeTestCase):
 
     def test_create_lead(self):
         bid = str(uuid.uuid4())
-        name, action = v1._apply_lead(bid, TENANT, None, {"lead_name": "Acme Co", "email_id": "a@b.com"})
+        email = f"acme-{uuid.uuid4().hex[:6]}@b.com"
+        name, action = v1._apply_lead(bid, TENANT, None, {"lead_name": "Acme Co", "email_id": email})
         self.assertEqual(action, "created")
         doc = frappe.get_doc("Lead", name)
         self.assertEqual(doc.brew93_id, bid)
         self.assertEqual(doc.brew93_tenant_id, TENANT)
-        self.assertEqual(doc.email_id, "a@b.com")
+        self.assertEqual(doc.email_id, email)
         self.assertTrue(doc.status)  # required field defaulted
 
     def test_matches_on_brew93_id_not_email(self):
         bid = str(uuid.uuid4())
-        name1, _ = v1._apply_lead(bid, TENANT, None, {"lead_name": "X", "email_id": "first@x.com"})
+        e1 = f"first-{uuid.uuid4().hex[:6]}@x.com"
+        e2 = f"changed-{uuid.uuid4().hex[:6]}@x.com"
+        name1, _ = v1._apply_lead(bid, TENANT, None, {"lead_name": "X", "email_id": e1})
         # same brew93_id, DIFFERENT email -> must update the SAME lead, no duplicate
-        name2, action = v1._apply_lead(bid, TENANT, None, {"lead_name": "X", "email_id": "changed@x.com"})
+        name2, action = v1._apply_lead(bid, TENANT, None, {"lead_name": "X", "email_id": e2})
         self.assertEqual(name1, name2)
         self.assertEqual(action, "updated")
-        self.assertEqual(frappe.get_doc("Lead", name2).email_id, "changed@x.com")
+        self.assertEqual(frappe.get_doc("Lead", name2).email_id, e2)
         self.assertEqual(frappe.db.count("Lead", {"brew93_id": bid}), 1)
 
     def test_update_preserves_inbound_lead_fields(self):
         bid = str(uuid.uuid4())
+        email = f"after-{uuid.uuid4().hex[:6]}@example.com"
         name, _ = v1._apply_lead(bid, TENANT, None, {"lead_name": "Before"})
         name2, action = v1._apply_lead(
             bid,
             TENANT,
             None,
-            {"lead_name": "After", "email_id": "after@example.com", "mobile_no": "555"},
+            {"lead_name": "After", "email_id": email, "mobile_no": "555"},
         )
         self.assertEqual((name2, action), (name, "updated"))
         doc = frappe.get_doc("Lead", name2)
         self.assertEqual(doc.lead_name, "After")
-        self.assertEqual(doc.email_id, "after@example.com")
+        self.assertEqual(doc.email_id, email)
         self.assertEqual(doc.mobile_no, "555")
 
     def test_status_mapping_from_brew93_enum(self):
@@ -377,21 +381,32 @@ class TestHandleGuards(FrappeTestCase):
         enqueue.assert_called_once()
 
     def test_run_backfill_updates_progress_with_name_cursor(self):
-        with patch("brew93_connector.api.backfill.cfg.is_enabled", return_value=True), \
+        orig_get_doc = frappe.get_doc
+        def mock_get_doc(*args, **kwargs):
+            if args and args[0] == "Lead":
+                return frappe._dict(name=args[1] if len(args) > 1 else "TEST-LEAD", as_dict=lambda: {"name": "TEST-LEAD"})
+            return orig_get_doc(*args, **kwargs)
+
+        with patch("brew93_connector.api.backfill.frappe.enqueue"), \
+             patch("brew93_connector.api.backfill.frappe.db.count", return_value=2), \
+             patch("brew93_connector.api.backfill.frappe.get_all", side_effect=[["TEST-LEAD-1", "TEST-LEAD-2"], []]), \
+             patch("brew93_connector.api.backfill.frappe.get_doc", side_effect=mock_get_doc), \
+             patch("brew93_connector.api.backfill.cfg.is_enabled", return_value=True), \
              patch("brew93_connector.api.backfill.cfg.get_settings", return_value={"source_site": "test"}), \
              patch("brew93_connector.api.backfill.outbound.enqueue_event", return_value="event-1") as enqueue:
-            job = backfill.start_backfill("Lead", page_size=1)
+            job = backfill.start_backfill("Lead", page_size=2)
             backfill.run_backfill(job["job_id"])
         status = backfill.get_backfill_status(job["job_id"])
         self.assertEqual(status["status"], "Completed")
-        self.assertEqual(status["processed"], status["total"])
-        self.assertEqual(status["queued"], status["total"])
-        self.assertGreaterEqual(enqueue.call_count, 1)
+        self.assertEqual(status["processed"], 2)
+        self.assertEqual(status["queued"], 2)
+        self.assertEqual(enqueue.call_count, 2)
 
     def test_run_backfill_marks_initialization_failure(self):
-        with patch("brew93_connector.api.backfill.cfg.is_enabled", return_value=True), \
+        with patch("brew93_connector.api.backfill.frappe.enqueue"), \
+             patch("brew93_connector.api.backfill.cfg.is_enabled", return_value=True), \
              patch("brew93_connector.api.backfill.cfg.get_settings", side_effect=RuntimeError("settings unavailable")):
-            job = backfill.start_backfill("Lead", page_size=1)
+            job = backfill.start_backfill("Lead", page_size=100)
             backfill.run_backfill(job["job_id"])
 
         status = backfill.get_backfill_status(job["job_id"])
@@ -400,10 +415,11 @@ class TestHandleGuards(FrappeTestCase):
         self.assertIsNotNone(status["finished_at"])
 
     def test_cancel_backfill_is_cooperative(self):
-        with patch("brew93_connector.api.backfill.cfg.is_enabled", return_value=True), \
+        with patch("brew93_connector.api.backfill.frappe.enqueue"), \
+             patch("brew93_connector.api.backfill.cfg.is_enabled", return_value=True), \
              patch("brew93_connector.api.backfill.cfg.get_settings", return_value={"source_site": "test"}), \
              patch("brew93_connector.api.backfill.outbound.enqueue_event", return_value="event-1"):
-            job = backfill.start_backfill("Lead", page_size=1)
+            job = backfill.start_backfill("Lead", page_size=100)
             result = backfill.cancel_backfill(job["job_id"])
             backfill.run_backfill(job["job_id"])
         self.assertTrue(result["cancel_requested"])

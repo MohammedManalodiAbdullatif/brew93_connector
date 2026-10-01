@@ -125,12 +125,16 @@ def enqueue_event(ref_doctype, ref_name, resource, event_type, payload) -> str |
     row.flags.ignore_permissions = True
     row.insert(ignore_permissions=True)
 
-    frappe.enqueue(
-        "brew93_connector.api.outbound.deliver_one",
-        queue="long",
-        enqueue_after_commit=True,
-        event_id=event_id,
-    )
+    try:
+        frappe.enqueue(
+            "brew93_connector.api.outbound.deliver_one",
+            queue="long",
+            enqueue_after_commit=True,
+            event_id=event_id,
+        )
+    except Exception:
+        # Durable event queue row is already stored; scheduled drain will deliver it.
+        pass
     return event_id
 
 
