@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import uuid
 
 import frappe
@@ -46,6 +47,13 @@ def is_integration_write() -> bool:
 
 def _payload_hash(payload: dict) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode()).hexdigest()
+
+
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+
+
+def _is_uuid(value) -> bool:
+    return bool(value) and bool(_UUID_RE.match(str(value)))
 
 
 # --- doc events ------------------------------------------------------------
@@ -180,37 +188,68 @@ def _is_superseded(row) -> bool:
     )
 
 
-def _deliver_lead_to_crm(row, action):
-    """Sync a lead to Brew93's CRM Leads via the workspace-admin login. Stores the
-    returned Brew93 lead id on the ERPNext Lead so later edits update in place."""
+CRM_RESOURCE_CONFIG = {
+    "leads": ("Lead", mapping.build_crm_lead_payload, "leads"),
+    "deals": ("Opportunity", mapping.build_crm_deal_payload, "deals"),
+    "contacts": ("Contact", mapping.build_crm_contact_payload, "contacts"),
+    "customers": ("Customer", mapping.build_crm_company_payload, "companies"),
+    "quotations": ("Quotation", mapping.build_crm_quote_payload, "quotes"),
+}
+
+
+def _deliver_to_crm(row, action):
+    """Sync a document to Brew93's CRM direct endpoints via workspace-admin bearer login.
+    Stores the returned Brew93 ID on the ERPNext document so subsequent edits update in place.
+    """
+    config = CRM_RESOURCE_CONFIG.get(row.brew93_resource)
+    if not config:
+        return client.Result(False, 400, "permanent", None, f"Unsupported CRM resource: {row.brew93_resource}")
+
+    doctype, builder, endpoint_resource = config
     payload_json = json.loads(row.payload or "{}")
+
     if action == "deleted":
         bid = payload_json.get("brew93_id")
         if not bid:
-            return client.Result(True, 200, None, {"skipped": "no brew93 lead"}, "ok")
-        return client.crm_delete_lead(bid, payload_json.get("owner"))
+            return client.Result(True, 200, None, {"skipped": f"no brew93 {endpoint_resource} id"}, "ok")
+        return client.crm_delete(endpoint_resource, bid, payload_json.get("owner"))
 
-    if not frappe.db.exists("Lead", row.ref_name):
-        return client.Result(True, 200, None, {"skipped": "lead removed"}, "ok")
-    doc = frappe.get_doc("Lead", row.ref_name)
+    if not frappe.db.exists(doctype, row.ref_name):
+        return client.Result(True, 200, None, {"skipped": f"{doctype} removed"}, "ok")
+
+    doc = frappe.get_doc(doctype, row.ref_name)
     values = cfg.get_settings()
-    crm_payload = mapping.build_crm_lead_payload(doc.as_dict(), values["source_site"])
+    crm_payload = builder(doc.as_dict(), values["source_site"])
     bid = doc.get("brew93_id")
-    result = client.crm_upsert_lead(bid, crm_payload, doc.owner)
+    if bid and not _is_uuid(bid):
+        bid = None
+
+    result = client.crm_upsert(endpoint_resource, bid, crm_payload, doc.owner)
     if result.ok and not bid and isinstance(result.body, dict):
         data = result.body.get("data") if isinstance(result.body.get("data"), dict) else result.body
         new_id = (data or {}).get("id")
         if new_id:
             frappe.flags.in_brew93_import = True  # silent write, no loop
             try:
-                frappe.db.set_value("Lead", doc.name, {
-                    "brew93_id": new_id,
-                    "brew93_tenant_id": values.get("brew93_tenant_id"),
-                    "brew93_synced_at": frappe.utils.now(),
-                }, update_modified=False)
+                update_fields = {"brew93_id": new_id}
+                meta = frappe.get_meta(doctype)
+                if meta.has_field("brew93_tenant_id"):
+                    update_fields["brew93_tenant_id"] = values.get("brew93_tenant_id")
+                if meta.has_field("brew93_synced_at"):
+                    update_fields["brew93_synced_at"] = frappe.utils.now()
+                frappe.db.set_value(doctype, doc.name, update_fields, update_modified=False)
+                frappe.db.commit()
             finally:
                 frappe.flags.in_brew93_import = False
     return result
+
+
+def _deliver_lead_to_crm(row, action):
+    return _deliver_to_crm(row, action)
+
+
+def _deliver_deal_to_crm(row, action):
+    return _deliver_to_crm(row, action)
 
 
 def _attempt(row):
@@ -234,10 +273,11 @@ def _attempt(row):
 
     try:
         if row.brew93_resource == "leads":
-            # Leads sync into Brew93's REAL CRM Leads (visible in the UI),
-            # authenticated as the workspace admin; keyed on brew93_id so a lead is
-            # created once and thereafter updated in place.
             result = _deliver_lead_to_crm(row, action)
+        elif row.brew93_resource == "deals":
+            result = _deliver_deal_to_crm(row, action)
+        elif row.brew93_resource in CRM_RESOURCE_CONFIG:
+            result = _deliver_to_crm(row, action)
         else:
             # Other resources still use the signed /events channel (-> staging).
             occurred_at = payload.get("updated_at") or mapping.to_iso8601_utc(now_datetime())

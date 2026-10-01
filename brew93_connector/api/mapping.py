@@ -193,6 +193,140 @@ def build_crm_lead_payload(doc: dict, source_site: str) -> dict:
     return _clean(record)
 
 
+def build_crm_deal_payload(doc: dict, source_site: str) -> dict:
+    """Map an ERPNext Opportunity to Brew93's CRM Deals API shape (POST/PUT /crm/deals)."""
+    title = (
+        doc.get("title")
+        or doc.get("customer_name")
+        or doc.get("party_name")
+        or doc.get("name")
+    )
+    val = doc.get("opportunity_amount") or doc.get("base_opportunity_amount") or doc.get("total")
+    value = float(val) if val is not None else None
+    prob = doc.get("probability")
+    probability = int(float(prob)) if prob is not None else None
+    record = {
+        "title": title,
+        "value": value,
+        "currency": doc.get("currency") or "INR",
+        "probability": probability,
+        "expected_close_date": to_date_str(doc.get("expected_closing")),
+        "custom_fields": {
+            "erpnext_name": doc["name"],
+            "source_site": source_site,
+            "status": doc.get("status"),
+            "sales_stage": doc.get("sales_stage"),
+            "opportunity_type": doc.get("opportunity_type"),
+        },
+    }
+    return _clean(record)
+
+
+def build_crm_contact_payload(doc: dict, source_site: str) -> dict:
+    """Map an ERPNext Contact to Brew93's CRM Contacts API shape (POST/PUT /crm/contacts)."""
+    email = doc.get("email_id") or _primary_from_children(doc.get("email_ids"), "email_id", ("is_primary",))
+    mobile = doc.get("mobile_no") or _primary_from_children(doc.get("phone_nos"), "phone", ("is_primary_mobile_no",))
+    phone = doc.get("phone") or _primary_from_children(doc.get("phone_nos"), "phone", ("is_primary_phone",))
+    record = {
+        "first_name": doc.get("first_name") or doc.get("name"),
+        "last_name": doc.get("last_name") or "",
+        "email": email,
+        "phone": phone,
+        "mobile": mobile,
+        "job_title": doc.get("designation"),
+        "department": doc.get("department"),
+        "custom_fields": {"erpnext_name": doc["name"], "source_site": source_site},
+    }
+    return _clean(record)
+
+
+def build_crm_company_payload(doc: dict, source_site: str) -> dict:
+    """Map an ERPNext Customer to Brew93's CRM Companies API shape (POST/PUT /crm/companies)."""
+    record = {
+        "name": doc.get("customer_name") or doc["name"],
+        "industry": doc.get("industry"),
+        "website": doc.get("website"),
+        "phone": doc.get("phone") or doc.get("mobile_no"),
+        "email": doc.get("email_id"),
+        "city": doc.get("city"),
+        "state": doc.get("state"),
+        "country": doc.get("country"),
+        "currency": doc.get("default_currency") or "INR",
+        "custom_fields": {
+            "erpnext_name": doc["name"],
+            "source_site": source_site,
+            "customer_group": doc.get("customer_group"),
+            "territory": doc.get("territory"),
+        },
+    }
+    return _clean(record)
+
+
+def build_crm_quote_payload(doc: dict, source_site: str) -> dict:
+    """Map an ERPNext Quotation to Brew93's CRM Quotes API shape (POST/PUT /crm/quotes)."""
+    status_map = {
+        "Draft": "draft",
+        "Open": "draft",
+        "Submitted": "sent",
+        "Ordered": "accepted",
+        "Lost": "rejected",
+        "Cancelled": "cancelled",
+        "Expired": "expired",
+    }
+    raw_status = doc.get("status") or "Draft"
+    status = status_map.get(raw_status, "draft")
+    if doc.get("docstatus") == 2:
+        status = "cancelled"
+
+    line_items = []
+    for it in (doc.get("items") or []):
+        qty = float(it.get("qty") or 1)
+        rate = float(it.get("rate") or 0)
+        line_items.append(_clean({
+            "name": it.get("item_name") or it.get("item_code") or "Item",
+            "quantity": max(1, qty),
+            "unit_price": max(0, rate),
+            "discount": float(it.get("discount_percentage") or 0),
+        }))
+    if not line_items:
+        line_items.append({"name": "Quotation Total", "quantity": 1, "unit_price": float(doc.get("grand_total") or doc.get("total") or 0)})
+
+    contact_bid = None
+    if doc.get("contact_person"):
+        try:
+            import frappe
+            contact_bid = frappe.db.get_value("Contact", doc["contact_person"], "brew93_id")
+        except Exception:
+            pass
+    deal_bid = None
+    if doc.get("opportunity"):
+        try:
+            import frappe
+            deal_bid = frappe.db.get_value("Opportunity", doc["opportunity"], "brew93_id")
+        except Exception:
+            pass
+
+    record = {
+        "quote_number": doc["name"],
+        "status": status,
+        "currency": doc.get("currency") or "INR",
+        "contact_id": contact_bid if (contact_bid and _is_uuid(contact_bid)) else None,
+        "deal_id": deal_bid if (deal_bid and _is_uuid(deal_bid)) else None,
+        "discount": float(doc.get("discount_amount") or 0),
+        "tax": float(doc.get("total_taxes_and_charges") or 0),
+        "valid_until": to_date_str(doc.get("valid_till")),
+        "notes": doc.get("terms") or doc.get("remarks"),
+        "line_items": line_items,
+        "custom_fields": {
+            "erpnext_name": doc.get("name"),
+            "customer_name": doc.get("customer_name") or doc.get("party_name"),
+            "party_name": doc.get("party_name"),
+            "source_site": source_site,
+        },
+    }
+    return _clean(record)
+
+
 def build_opportunity_record(doc: dict, source_site: str) -> dict:
     """Map an ERPNext Opportunity dict to a Brew93 `deals/bulk` record.
 
@@ -405,7 +539,8 @@ EVENT_SCHEMA_VERSION = 1
 
 def event_type(resource: str, action: str) -> str:
     """('leads', 'upserted') -> 'lead.upserted'. action in {'upserted','deleted'}."""
-    return f"{EVENT_TYPE_PREFIX[resource]}.{action}"
+    prefix = EVENT_TYPE_PREFIX.get(resource, resource.rstrip("s"))
+    return f"{prefix}.{action}"
 
 
 def build_event_envelope(

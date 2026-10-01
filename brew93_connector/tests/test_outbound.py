@@ -144,10 +144,11 @@ class TestOutboundQueue(FrappeTestCase):
         self.assertEqual(row.attempts, 1)
         self.assertIsNone(row.next_attempt)
 
-    def test_customer_event_posts_valid_envelope(self):
-        # non-lead resources still go through the signed /events channel
-        eid = outbound.enqueue_event("Customer", "CUST-ENV-1", "customers", "customers.upserted",
-                                     {"external_id": "CUST-ENV-1", "customer_name": "Env Co"})
+    def test_generic_event_posts_valid_envelope(self):
+        # unmapped/generic resources still go through the signed /events channel
+        name = f"ITEM-ENV-{self._testMethodName}"
+        eid = outbound.enqueue_event("Item", name, "items", "items.upserted",
+                                     {"external_id": name, "item_name": "Env Co"})
         captured = {}
 
         def _capture(raw_body, event_id):
@@ -160,11 +161,11 @@ class TestOutboundQueue(FrappeTestCase):
         body = json.loads(captured["raw_body"])
         self.assertEqual(captured["event_id"], eid)
         self.assertEqual(body["event_id"], eid)          # header == body event_id
-        self.assertEqual(body["event_type"], "customer.upserted")
+        self.assertEqual(body["event_type"], "item.upserted")
         self.assertEqual(body["schema_version"], 1)
         self.assertEqual(body["source"], "erpnext")
         self.assertEqual(body["tenant_id"], SETTINGS["brew93_tenant_id"])
-        self.assertEqual(body["data"]["external_id"], "CUST-ENV-1")
+        self.assertEqual(body["data"]["external_id"], name)
 
     def test_lead_delivers_via_crm_not_events(self):
         # leads sync to the real Brew93 CRM (crm path), NOT the /events channel
@@ -205,15 +206,16 @@ class TestOutboundQueue(FrappeTestCase):
             self.assertEqual(row.attempts, 3)
             self.assertIsNone(row.next_attempt)
 
-    def test_customer_delete_posts_delete_envelope(self):
-        eid = outbound.enqueue_event("Customer", "CUST-DEL-9", "customers", "customers.deleted",
-                                     {"external_id": "CUST-DEL-9"})
+    def test_generic_delete_posts_delete_envelope(self):
+        name = f"ITEM-DEL-{self._testMethodName}"
+        eid = outbound.enqueue_event("Item", name, "items", "items.deleted",
+                                     {"external_id": name})
         captured = {}
         with patch.object(client, "post_event", side_effect=lambda rb, ev: captured.update(raw_body=rb) or _ok()):
             outbound.deliver_one(eid)
         body = json.loads(captured["raw_body"])
-        self.assertEqual(body["event_type"], "customer.deleted")
-        self.assertEqual(body["data"], {"external_id": "CUST-DEL-9"})
+        self.assertEqual(body["event_type"], "item.deleted")
+        self.assertEqual(body["data"], {"external_id": name})
         self.assertEqual(frappe.get_doc("Brew93 Event Queue", eid).status, "Delivered")
 
     def test_disabled_connector_skips_delivery(self):

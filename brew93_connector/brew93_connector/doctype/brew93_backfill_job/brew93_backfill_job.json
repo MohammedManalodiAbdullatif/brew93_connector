@@ -1,0 +1,27 @@
+{
+ "actions": [],
+ "autoname": "field:job_id",
+ "doctype": "DocType",
+ "engine": "InnoDB",
+ "field_order": ["job_id", "doctype_name", "status", "page_size", "total", "processed", "queued", "skipped", "last_name", "cancel_requested", "error", "started_at", "finished_at"],
+ "fields": [
+  {"fieldname":"job_id","fieldtype":"Data","label":"Job ID","reqd":1,"unique":1,"read_only":1,"in_list_view":1},
+  {"fieldname":"doctype_name","fieldtype":"Data","label":"DocType","reqd":1,"read_only":1,"in_list_view":1},
+  {"fieldname":"status","fieldtype":"Select","label":"Status","options":"Queued\nRunning\nCompleted\nFailed\nCancelled","default":"Queued","read_only":1,"in_list_view":1},
+  {"fieldname":"page_size","fieldtype":"Int","label":"Page Size","read_only":1},
+  {"fieldname":"total","fieldtype":"Int","label":"Total","read_only":1},
+  {"fieldname":"processed","fieldtype":"Int","label":"Processed","read_only":1},
+  {"fieldname":"queued","fieldtype":"Int","label":"Queued Events","read_only":1},
+  {"fieldname":"skipped","fieldtype":"Int","label":"Skipped","read_only":1},
+  {"fieldname":"last_name","fieldtype":"Data","label":"Last Name","read_only":1},
+  {"fieldname":"cancel_requested","fieldtype":"Check","label":"Cancel Requested","read_only":1},
+  {"fieldname":"error","fieldtype":"Small Text","label":"Error","read_only":1},
+  {"fieldname":"started_at","fieldtype":"Datetime","label":"Started At","read_only":1},
+  {"fieldname":"finished_at","fieldtype":"Datetime","label":"Finished At","read_only":1}
+ ],
+ "module":"Brew93 Connector",
+ "name":"Brew93 Backfill Job",
+ "permissions":[{"role":"System Manager","read":1,"write":1,"create":1,"delete":1,"report":1}],
+ "sort_field":"modified",
+ "sort_order":"DESC"
+}

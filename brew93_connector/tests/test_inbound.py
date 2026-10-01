@@ -45,6 +45,21 @@ class TestApplyLead(FrappeTestCase):
         self.assertEqual(frappe.get_doc("Lead", name2).email_id, "changed@x.com")
         self.assertEqual(frappe.db.count("Lead", {"brew93_id": bid}), 1)
 
+    def test_update_preserves_inbound_lead_fields(self):
+        bid = str(uuid.uuid4())
+        name, _ = v1._apply_lead(bid, TENANT, None, {"lead_name": "Before"})
+        name2, action = v1._apply_lead(
+            bid,
+            TENANT,
+            None,
+            {"lead_name": "After", "email_id": "after@example.com", "mobile_no": "555"},
+        )
+        self.assertEqual((name2, action), (name, "updated"))
+        doc = frappe.get_doc("Lead", name2)
+        self.assertEqual(doc.lead_name, "After")
+        self.assertEqual(doc.email_id, "after@example.com")
+        self.assertEqual(doc.mobile_no, "555")
+
     def test_status_mapping_from_brew93_enum(self):
         bid = str(uuid.uuid4())
         name, _ = v1._apply_lead(bid, TENANT, None, {"lead_name": "Y", "status": "qualified"})
@@ -209,6 +224,7 @@ class TestApplyQuotation(FrappeTestCase):
         frappe.set_user("Administrator")
         frappe.flags.in_brew93_import = False
         self.lead = frappe.get_doc({"doctype": "Lead", "lead_name": "Quotation Party", "status": "Lead"}).insert()
+        self.contact = frappe.get_doc({"doctype": "Contact", "first_name": "Quotation Buyer"}).insert()
 
     def test_create_and_update_quotation_is_idempotent(self):
         bid = str(uuid.uuid4())
@@ -218,6 +234,38 @@ class TestApplyQuotation(FrappeTestCase):
         name2, action = v1._apply_quotation(bid, TENANT, None, {**data, "title": "Updated Quote"})
         self.assertEqual((name2, action), (name, "updated"))
         self.assertEqual(frappe.db.count("Quotation", {"brew93_id": bid}), 1)
+        self.assertEqual(frappe.get_doc("Quotation", name2).title, "Updated Quote")
+
+    def test_maps_outbound_party_and_customer_contact_details(self):
+        bid = str(uuid.uuid4())
+        name, action = v1._apply_quotation(bid, TENANT, None, {
+            "party_type": "Lead",
+            "party_id": self.lead.name,
+            "customer_name": "Quotation Party Display Name",
+            "contact_person": self.contact.name,
+            "contact_mobile": "555-0100",
+            "contact_email": "buyer@example.com",
+            "customer_group": "Commercial",
+            "territory": "India",
+            "title": "Complete Quote",
+        })
+        self.assertEqual(action, "created")
+        doc = frappe.get_doc("Quotation", name)
+        self.assertEqual(doc.quotation_to, "Lead")
+        self.assertEqual(doc.party_name, self.lead.name)
+        self.assertEqual(doc.customer_name, "Quotation Party Display Name")
+        self.assertEqual(doc.contact_person, self.contact.name)
+        self.assertEqual(doc.contact_mobile, "555-0100")
+        self.assertEqual(doc.contact_email, "buyer@example.com")
+        self.assertEqual(doc.customer_group, "Commercial")
+        self.assertEqual(doc.territory, "India")
+
+    def test_rejects_unresolved_quotation_party(self):
+        with self.assertRaises(v1._ApiError) as ctx:
+            v1._apply_quotation(str(uuid.uuid4()), TENANT, None, {
+                "party_type": "Lead", "party_id": "MISSING-LEAD",
+            })
+        self.assertEqual(ctx.exception.code, "party_unresolved")
 
 
 class TestHandleGuards(FrappeTestCase):
@@ -278,6 +326,12 @@ class TestHandleGuards(FrappeTestCase):
             self.assertTrue(callable(fn))
 
     def test_backfill_is_bounded_and_uses_queue(self):
+        if not frappe.db.count("Lead"):
+            frappe.get_doc({
+                "doctype": "Lead",
+                "lead_name": "Backfill Test Lead",
+                "status": "Lead",
+            }).insert(ignore_permissions=True)
         with patch("brew93_connector.api.backfill.cfg.is_enabled", return_value=True), \
              patch("brew93_connector.api.backfill.cfg.get_settings", return_value={"source_site": "test"}), \
              patch("brew93_connector.api.backfill.outbound.enqueue_event", return_value="event-1") as enqueue:
@@ -285,3 +339,72 @@ class TestHandleGuards(FrappeTestCase):
         self.assertLessEqual(result["requested"], 500)
         self.assertEqual(result["queued"], result["requested"])
         self.assertTrue(enqueue.called)
+
+    def test_backfill_allows_administrator(self):
+        with patch.object(frappe.local, "session", frappe._dict(user="Administrator")), \
+             patch("brew93_connector.api.backfill.frappe.get_roles", return_value=[]), \
+             patch("brew93_connector.api.backfill.cfg.is_enabled", return_value=True):
+            backfill._require_backfill_access()
+
+    def test_backfill_allows_system_manager(self):
+        with patch.object(frappe.local, "session", frappe._dict(user="backfill-manager@example.com")), \
+             patch("brew93_connector.api.backfill.frappe.get_roles", return_value=["System Manager"]), \
+             patch("brew93_connector.api.backfill.cfg.is_enabled", return_value=True):
+            backfill._require_backfill_access()
+
+    def test_backfill_allows_integration_role(self):
+        with patch.object(frappe.local, "session", frappe._dict(user="brew93-integration@example.com")), \
+             patch("brew93_connector.api.backfill.frappe.get_roles", return_value=["Brew93 Integration"]), \
+             patch("brew93_connector.api.backfill.cfg.is_enabled", return_value=True):
+            backfill._require_backfill_access()
+
+    def test_backfill_rejects_guest_and_ordinary_user(self):
+        for user in ("Guest", "ordinary-user@example.com"):
+            with self.subTest(user=user), \
+                 patch.object(frappe.local, "session", frappe._dict(user=user)), \
+                 patch("brew93_connector.api.backfill.frappe.get_roles", return_value=["Employee"]), \
+                 patch("brew93_connector.api.backfill.cfg.is_enabled", return_value=True), \
+                 self.assertRaises(frappe.PermissionError):
+                backfill._require_backfill_access()
+
+    def test_start_backfill_creates_job_and_enqueues_worker(self):
+        with patch("brew93_connector.api.backfill.cfg.is_enabled", return_value=True), \
+             patch("brew93_connector.api.backfill.frappe.enqueue") as enqueue:
+            result = backfill.start_backfill("Lead", page_size=9999)
+        self.assertTrue(result["job_id"])
+        self.assertEqual(result["status"], "Queued")
+        self.assertEqual(frappe.db.get_value("Brew93 Backfill Job", result["job_id"], "page_size"), 500)
+        enqueue.assert_called_once()
+
+    def test_run_backfill_updates_progress_with_name_cursor(self):
+        with patch("brew93_connector.api.backfill.cfg.is_enabled", return_value=True), \
+             patch("brew93_connector.api.backfill.cfg.get_settings", return_value={"source_site": "test"}), \
+             patch("brew93_connector.api.backfill.outbound.enqueue_event", return_value="event-1") as enqueue:
+            job = backfill.start_backfill("Lead", page_size=1)
+            backfill.run_backfill(job["job_id"])
+        status = backfill.get_backfill_status(job["job_id"])
+        self.assertEqual(status["status"], "Completed")
+        self.assertEqual(status["processed"], status["total"])
+        self.assertEqual(status["queued"], status["total"])
+        self.assertGreaterEqual(enqueue.call_count, 1)
+
+    def test_run_backfill_marks_initialization_failure(self):
+        with patch("brew93_connector.api.backfill.cfg.is_enabled", return_value=True), \
+             patch("brew93_connector.api.backfill.cfg.get_settings", side_effect=RuntimeError("settings unavailable")):
+            job = backfill.start_backfill("Lead", page_size=1)
+            backfill.run_backfill(job["job_id"])
+
+        status = backfill.get_backfill_status(job["job_id"])
+        self.assertEqual(status["status"], "Failed")
+        self.assertEqual(status["error"], "settings unavailable")
+        self.assertIsNotNone(status["finished_at"])
+
+    def test_cancel_backfill_is_cooperative(self):
+        with patch("brew93_connector.api.backfill.cfg.is_enabled", return_value=True), \
+             patch("brew93_connector.api.backfill.cfg.get_settings", return_value={"source_site": "test"}), \
+             patch("brew93_connector.api.backfill.outbound.enqueue_event", return_value="event-1"):
+            job = backfill.start_backfill("Lead", page_size=1)
+            result = backfill.cancel_backfill(job["job_id"])
+            backfill.run_backfill(job["job_id"])
+        self.assertTrue(result["cancel_requested"])
+        self.assertEqual(backfill.get_backfill_status(job["job_id"])["status"], "Cancelled")

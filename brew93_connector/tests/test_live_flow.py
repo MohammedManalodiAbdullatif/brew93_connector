@@ -120,11 +120,11 @@ class TestLiveLeadFlow(FrappeTestCase):
                               order_by="creation asc")
 
     def _enqueue_customer(self, name=None, **data):
-        # Leads now sync to Brew93's CRM; the signed /events transport carries the
-        # OTHER resources. Exercise that transport (HMAC/backoff/supersede) here.
+        # The signed /events transport carries webhook / custom events. Exercise that
+        # transport (HMAC/backoff/supersede) here.
         name = name or f"CUST-E2E-{uuid.uuid4().hex[:8]}"
         payload = {"external_id": name, "customer_name": data.pop("customer_name", "E2E Cust"), **data}
-        return name, outbound.enqueue_event("Customer", name, "customers", "customers.upserted", payload)
+        return name, outbound.enqueue_event("Customer", name, "custom_events", "custom_events.upserted", payload)
 
     # --- capture: local detection, no blocking HTTP ------------------------
     def test_create_lead_enqueues_one_event_and_sends_nothing_inline(self):
@@ -136,7 +136,11 @@ class TestLiveLeadFlow(FrappeTestCase):
         self.assertEqual(rows[0].status, "Pending")
         self.assertEqual(rows[0].event_type, "leads.upserted")
         # Lead insert also enqueues unrelated framework jobs; look at ours only.
-        ours = [c for c in self.enqueue.call_args_list if c.args and c.args[0] == "brew93_connector.api.outbound.deliver_one"]
+        ours = [
+            c for c in self.enqueue.call_args_list
+            if c.args and c.args[0] == "brew93_connector.api.outbound.deliver_one"
+            and c.kwargs.get("event_id") == rows[0].name
+        ]
         self.assertEqual(len(ours), 1)
         args, kwargs = ours[0]
         self.assertEqual(kwargs["queue"], "long")
@@ -155,8 +159,8 @@ class TestLiveLeadFlow(FrappeTestCase):
         self.assertFalse(any(c.args and c.args[0].endswith("deliver_one") for c in self.enqueue.call_args_list))
 
     # --- delivery: signed /events event to the local receiver --------------
-    # (leads now go to the CRM; the /events transport carries the rest, so the
-    #  transport-level guarantees are exercised here with a `customers` event.)
+    # (CRM resources sync to direct CRM endpoints; the /events transport carries
+    #  webhook / custom resources. Exercise that transport here.)
     def test_create_delivers_signed_event(self):
         name, eid = self._enqueue_customer(customer_name="Buyer Co")
         outbound.deliver_one(eid)
@@ -168,7 +172,7 @@ class TestLiveLeadFlow(FrappeTestCase):
         body = got["body"]
         self.assertEqual(got["event_id_header"], eid)
         self.assertEqual(body["event_id"], eid)
-        self.assertEqual(body["event_type"], "customer.upserted")
+        self.assertEqual(body["event_type"], "custom_event.upserted")
         self.assertEqual(body["tenant_id"], TENANT)
         self.assertEqual(body["source_site"], "rag.klyonix.in")
         self.assertEqual(body["data"]["external_id"], name)

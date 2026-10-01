@@ -59,6 +59,26 @@ def ensure_integration_identity():
     return {"role": INTEGRATION_ROLE, "user": INTEGRATION_USER}
 
 
+def ensure_integration_credentials():
+    """Create or retrieve the integration user's API credentials server-side.
+
+    The secret is returned only to the caller that immediately registers it with
+    Brew93. It is never printed, persisted in browser state, or returned by an
+    API intended for the setup page.
+    """
+    ensure_integration_identity()
+    user = frappe.get_doc("User", INTEGRATION_USER)
+    api_secret = user.get_password("api_secret", raise_exception=False)
+    if not user.api_key or not api_secret:
+        if not user.api_key:
+            user.api_key = frappe.generate_hash(length=15)
+        api_secret = frappe.generate_hash(length=15)
+        user.api_secret = api_secret
+        user.save(ignore_permissions=True)
+        frappe.db.commit()
+    return {"user": INTEGRATION_USER, "api_key": user.api_key, "api_secret": api_secret}
+
+
 def repair_custom_docperms(doctypes=None):
     """Copy any missing standard DocPerm rows into Custom DocPerm.
 

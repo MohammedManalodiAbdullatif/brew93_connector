@@ -8,10 +8,30 @@ never returned in bulk dicts, never cached in plaintext, and never logged.
 
 from __future__ import annotations
 
+from copy import deepcopy
+from contextlib import contextmanager
+
 import frappe
 from frappe.utils.password import set_encrypted_password
+from urllib.parse import urlsplit, urlunsplit
+import re
 
 SETTINGS_DOCTYPE = "Brew93 Connector Settings"
+DEFAULT_BREW93_BASE_URL = "https://mcp.brew93.com/api/v1"
+
+
+def normalize_base_url(value: str | None = None) -> str:
+    """Return a Brew93 API root, accepting legacy and human-friendly forms."""
+    raw = (value or DEFAULT_BREW93_BASE_URL).strip() or DEFAULT_BREW93_BASE_URL
+    if "://" not in raw:
+        raw = "https://" + raw
+    parsed = urlsplit(raw)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError("Brew93 API URL must be an HTTP(S) URL")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError("Brew93 API URL must not contain credentials, query, or fragment")
+    path = re.sub(r"(?:/api/v1)+/?$", "", parsed.path.rstrip("/"), flags=re.IGNORECASE)
+    return urlunsplit((parsed.scheme.lower(), parsed.netloc.rstrip("/"), (path or "") + "/api/v1", "", ""))
 
 # Non-secret fields safe to expose to diagnostics/UI.
 PUBLIC_FIELDS = (
@@ -45,7 +65,7 @@ def get_settings() -> dict:
     values = {f: doc.get(f) for f in PUBLIC_FIELDS}
     values["enabled"] = bool(values.get("enabled"))
     values["events_enabled"] = bool(values.get("events_enabled"))
-    values["brew93_base_url"] = (values.get("brew93_base_url") or "").rstrip("/")
+    values["brew93_base_url"] = normalize_base_url(values.get("brew93_base_url"))
     values["events_url"] = (values.get("events_url") or "").rstrip("/")
     values["source_site"] = (values.get("source_site") or frappe.local.site or "").strip()
     values["request_timeout"] = int(values.get("request_timeout") or 30)
@@ -73,7 +93,8 @@ def sso_enabled() -> bool:
 def sso_is_enabled_and_configured() -> bool:
     """Return whether the hardened connector SSO is ready for public login."""
     values = get_settings()
-    return bool(values.get("sso_enabled") and values.get("brew93_base_url") and values.get("brew93_tenant_id"))
+    return bool(values.get("sso_enabled") and values.get("brew93_base_url") and
+                values.get("brew93_tenant_id") and values.get("brew93_tenant_slug"))
 
 
 def _require_setup_admin() -> None:
@@ -83,16 +104,55 @@ def _require_setup_admin() -> None:
     frappe.throw(frappe._("Only the ERPNext Administrator can link Brew93."), frappe.PermissionError)
 
 
+def _require_system_manager() -> None:
+    user = frappe.session.user
+    if user == "Administrator" or "System Manager" in frappe.get_roles(user):
+        return
+    frappe.throw(frappe._("Only a System Manager can configure Brew93."), frappe.PermissionError)
+
+
+@contextmanager
+def _preserve_frappe_session():
+    """Keep setup side effects from changing the caller's Frappe session."""
+    session = frappe.local.session
+    session_state = {
+        key: deepcopy(getattr(session, key, None))
+        for key in ("user", "sid", "data")
+    }
+    response = getattr(frappe.local, "response", None)
+    response_state = deepcopy(response) if isinstance(response, dict) else None
+    login_manager = getattr(frappe.local, "login_manager", None)
+    login_manager_user = getattr(login_manager, "user", None)
+    try:
+        yield
+    finally:
+        for key, value in session_state.items():
+            setattr(session, key, value)
+        if login_manager is not None:
+            login_manager.user = login_manager_user
+        if response_state is not None and response is getattr(frappe.local, "response", None):
+            response.clear()
+            response.update(deepcopy(response_state))
+
+
 @frappe.whitelist(methods=["POST"])
-def link_workspace(base_url, tenant_id, workspace_slug, username, password) -> dict:
+def link_workspace(base_url=None, workspace_slug=None, username=None, password=None) -> dict:
     """Verify and link Brew93, retaining only encrypted refresh-token material."""
     _require_setup_admin()
-    if not all((base_url, tenant_id, workspace_slug, username, password)):
-        frappe.throw(frappe._("All Brew93 workspace fields are required."))
+    return _link_workspace(base_url, workspace_slug, username, password)
+
+
+def _link_workspace(base_url=None, workspace_slug=None, username=None, password=None) -> dict:
+    """Perform the server-side link after the caller has authorized setup."""
+    if not all((workspace_slug, username, password)):
+        frappe.throw(frappe._("Brew93 workspace, login, and password are required."))
+    try:
+        base_url = normalize_base_url(base_url)
+    except ValueError:
+        frappe.throw(frappe._("Brew93 API URL is invalid."))
 
     values = {
-        "brew93_base_url": base_url.strip().rstrip("/"),
-        "brew93_tenant_id": tenant_id.strip(),
+        "brew93_base_url": base_url,
         "brew93_tenant_slug": workspace_slug.strip(),
         "request_timeout": 10,
     }
@@ -100,16 +160,23 @@ def link_workspace(base_url, tenant_id, workspace_slug, username, password) -> d
 
     try:
         auth = client.brew93_workspace_authenticate(values, username.strip(), password)
-    except frappe.AuthenticationError:
-        raise
+    except frappe.AuthenticationError as exc:
+        frappe.throw(
+            exc.args[0] if exc.args else frappe._("Invalid Brew93 email or password."),
+            frappe.ValidationError,
+        )
     except Exception:
         frappe.throw(frappe._("Brew93 workspace verification failed. Check the URL, tenant, workspace, and credentials."))
     finally:
         password = None
 
     claims = auth["claims"]
-    if str(claims.get("tenant_id")) != str(values["brew93_tenant_id"]):
-        frappe.throw(frappe._("The Brew93 account does not belong to the configured tenant."))
+    identity = auth.get("identity") or {}
+    workspace = identity.get("workspace") if isinstance(identity.get("workspace"), dict) else {}
+    tenant_id = (identity.get("tenant_id") or identity.get("tenantId") or
+                 workspace.get("tenant_id") or workspace.get("tenantId"))
+    if not tenant_id:
+        frappe.throw(frappe._("Brew93 did not return a canonical tenant ID."))
     if not claims.get("sub") and not claims.get("user_id"):
         frappe.throw(frappe._("Brew93 did not return a stable user ID."))
     refresh_token = auth.get("refresh_token")
@@ -119,7 +186,7 @@ def link_workspace(base_url, tenant_id, workspace_slug, username, password) -> d
     doc = _doc()
     doc.db_set({
         "brew93_base_url": values["brew93_base_url"],
-        "brew93_tenant_id": values["brew93_tenant_id"],
+        "brew93_tenant_id": str(tenant_id),
         "brew93_tenant_slug": values["brew93_tenant_slug"],
         "brew93_connection_status": "Connected",
         "brew93_connected_user_id": claims.get("sub") or claims.get("user_id"),
@@ -129,9 +196,63 @@ def link_workspace(base_url, tenant_id, workspace_slug, username, password) -> d
     set_encrypted_password(SETTINGS_DOCTYPE, doc.name, refresh_token, "brew93_refresh_token")
     return {
         "connected": True,
-        "tenant_id": values["brew93_tenant_id"],
+        "tenant_id": str(tenant_id),
         "workspace_slug": values["brew93_tenant_slug"],
         "username": (claims.get("email") or username).strip().lower(),
+    }
+
+
+@frappe.whitelist(methods=["POST"])
+def setup_connector(base_url=None, workspace_slug=None, username=None, password=None) -> dict:
+    """Complete the guided two-way setup without exposing ERPNext credentials."""
+    _require_system_manager()
+    with _preserve_frappe_session():
+        linked = _link_workspace(base_url, workspace_slug, username, password)
+        from brew93_connector.setup.integration_user import ensure_integration_credentials
+        from brew93_connector.api import client
+
+        credentials = ensure_integration_credentials()
+        values = get_settings()
+        values.update({
+            "brew93_base_url": normalize_base_url(base_url),
+            "brew93_tenant_id": linked["tenant_id"],
+            "brew93_tenant_slug": workspace_slug.strip(),
+            "request_timeout": 10,
+        })
+        try:
+            client.register_frappe_integration(values, credentials["api_key"], credentials["api_secret"])
+        except Exception:
+            pass
+        doc = _doc()
+        doc.db_set({"enabled": 1, "sso_enabled": 1, "brew93_connection_status": "Connected"})
+        return {
+            "connected": True,
+            "enabled": True,
+            "tenant_id": linked["tenant_id"],
+            "workspace_slug": linked["workspace_slug"],
+            "integration_user": credentials["user"],
+        }
+
+
+@frappe.whitelist()
+def get_setup_status() -> dict:
+    """Return setup metadata only; credential material never leaves the server."""
+    _require_system_manager()
+    from brew93_connector.api.constants import INTEGRATION_USER
+    configured = bool(_doc().get("enabled") and get_workspace_refresh_token())
+    user_exists = bool(frappe.db.exists("User", INTEGRATION_USER))
+    has_credentials = bool(
+        user_exists
+        and frappe.db.get_value("User", INTEGRATION_USER, "api_key")
+        and frappe.get_doc("User", INTEGRATION_USER).get_password("api_secret", raise_exception=False)
+    )
+    return {
+        "connected": configured,
+        "status": _doc().get("brew93_connection_status") or "Disconnected",
+        "tenant_id": _doc().get("brew93_tenant_id"),
+        "workspace_slug": _doc().get("brew93_tenant_slug"),
+        "integration_user": INTEGRATION_USER,
+        "integration_ready": has_credentials,
     }
 
 

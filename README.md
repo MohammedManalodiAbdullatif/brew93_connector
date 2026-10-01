@@ -15,11 +15,11 @@ Isolated Frappe app implementing the bidirectional Brew93 CRM ↔ ERPNext integr
 
 ## Production setup
 
-The ERPNext Administrator must use `/desk/brew93-integration` and select **Link
-Workspace**. Enter the Brew93 Base URL, Tenant ID, Workspace Slug, Brew93 Username,
-and Brew93 Password. The password is used only for verification; the connector stores
-only the encrypted Brew93 workspace refresh token. `/app/brew93-integration` remains
-available as a compatibility route and redirects to the Administrator setup page.
+The ERPNext Administrator or System Manager must use `/app/brew93-integration`.
+Enter the Brew93 API URL, Workspace Slug, Brew93 Login, and Brew93 Password. The
+password is used only for verification; Brew93's authenticated workspace response
+provides the canonical tenant ID, which the connector stores internally alongside
+the requested slug. `/app/brew93-integration` is the unified setup route.
 
 Everything is inert until `Brew93 Connector Settings.enabled` (and `events_enabled`) is
 turned on. Installed only on the ERPNext site (`rag.klyonix.in`).

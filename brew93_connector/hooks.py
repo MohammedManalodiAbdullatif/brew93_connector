@@ -15,9 +15,10 @@ override_whitelisted_methods = {
 }
 
 # ---------------------------------------------------------------------------
-# Installation: create the external-ID mapping fields on the synced DocTypes.
+# Installation: create external-ID mapping fields and integration identity.
 # ---------------------------------------------------------------------------
-after_install = "brew93_connector.setup.custom_fields.create_external_id_fields"
+after_install = "brew93_connector.setup.install.after_install"
+after_migrate = "brew93_connector.setup.install.after_migrate"
 before_uninstall = "brew93_connector.setup.custom_fields.remove_external_id_fields"
 
 # ---------------------------------------------------------------------------
@@ -54,12 +55,13 @@ doc_events = {
     },
 }
 
-# Drain the outbound queue with backoff. Handler exits immediately when
-# the integration is disabled, so this is safe to leave scheduled.
+# Drain the outbound queue and pull recent updates from Brew93.
+# Handlers exit immediately when the integration is disabled.
 scheduler_events = {
     "cron": {
         "*/5 * * * *": [
             "brew93_connector.api.outbound.drain_queue",
+            "brew93_connector.api.sync.pull_all_from_brew93",
         ],
     },
 }

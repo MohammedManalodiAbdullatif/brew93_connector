@@ -18,7 +18,7 @@ import requests
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
-from brew93_connector.api import client, signing  # noqa: E402
+from brew93_connector.api import client, settings, signing  # noqa: E402
 
 SECRET = "throwaway-test-secret"
 URL = "https://example.invalid/api/v1/integrations/erpnext/events"
@@ -32,6 +32,20 @@ class _Resp:
 
 
 class TestSenderSignsExactBytes(unittest.TestCase):
+    def test_base_url_defaults_to_canonical_api_root(self):
+        self.assertEqual(settings.normalize_base_url(), "https://mcp.brew93.com/api/v1")
+
+    def test_base_url_normalizes_origin_trailing_and_duplicate_api_path(self):
+        for supplied in ("brew93.example", "https://brew93.example/", "https://brew93.example/api/v1/api/v1/"):
+            with self.subTest(supplied=supplied):
+                self.assertEqual(settings.normalize_base_url(supplied), "https://brew93.example/api/v1")
+
+    def test_base_url_rejects_credentials_and_query(self):
+        for supplied in ("https://user:pass@brew93.example", "https://brew93.example/api/v1?x=1"):
+            with self.subTest(supplied=supplied):
+                with self.assertRaises(ValueError):
+                    settings.normalize_base_url(supplied)
+
     def test_http_user_login_rejects_before_session_or_password_use(self):
         session = MagicMock()
         with patch.object(client, "_session", return_value=session) as make_session, \
@@ -134,6 +148,38 @@ class TestSenderSignsExactBytes(unittest.TestCase):
             session_factory.return_value.post.return_value = response
             self.assertEqual(client._get_user_crm_token(values, "user@example.com"), "user-access")
             self.assertEqual(session_factory.return_value.post.call_args.kwargs["json"]["refresh_token"], "user-refresh")
+
+    def test_register_frappe_integration_uses_configured_v1_base_and_tenant(self):
+        session = MagicMock()
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"data": {"registered": True}}
+        session.put.return_value = response
+        values = {
+            "brew93_base_url": "https://brew93.example/api/v1/",
+            "brew93_tenant_slug": "kly",
+            "request_timeout": 5,
+        }
+        sent_payload = {}
+        def put(*args, **kwargs):
+            sent_payload.update(kwargs["json"])
+            return response
+        session.put.side_effect = put
+        with patch.object(client, "_session", return_value=session), \
+             patch.object(client, "_get_user_crm_token", return_value="workspace-token"), \
+             patch.object(client.frappe.utils, "get_url", return_value="https://erpnext.example"):
+            result = client.register_frappe_integration(values, "api-key", "api-secret")
+
+        session.put.assert_called_once_with(
+            "https://brew93.example/api/v1/crm/integrations/frappe",
+            json={},
+            headers={"Authorization": "Bearer workspace-token", "x-tenant-slug": "kly"},
+            timeout=(5, 5),
+        )
+        self.assertEqual(sent_payload, {
+            "base_url": "https://erpnext.example", "api_key": "api-key", "api_secret": "api-secret",
+        })
+        self.assertTrue(result.ok)
+        self.assertNotIn("api-secret", repr(result.body))
 
     def test_refresh_cache_is_tenant_scoped(self):
         first = {"source_site": "site-a", "brew93_tenant_id": "tenant-a"}
@@ -361,6 +407,15 @@ class TestSenderSignsExactBytes(unittest.TestCase):
                                          {"sub": "user", "tenant_id": "tenant"})
         kwargs = session.get.call_args.kwargs
         self.assertEqual(kwargs["headers"], {"Authorization": "Bearer access-token", "x-tenant-slug": "kly"})
+
+    def test_setup_auth_me_slug_mismatch_fails_closed(self):
+        session = MagicMock()
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"data": {"sub": "user", "tenant_id": "tenant", "workspace_slug": "other"}}
+        session.get.return_value = response
+        values = {"brew93_base_url": "https://example.invalid", "brew93_tenant_slug": "kly", "request_timeout": 5}
+        with self.assertRaisesRegex(client.Brew93ConfigError, "workspace"):
+            client._validate_remote_identity(session, values, "access-token", {"sub": "user", "tenant_id": "tenant"})
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ web login_manager. Everything stays disabled on the site.
 """
 
 import uuid
+from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
 import frappe
@@ -128,6 +129,7 @@ class TestSSOGuards(FrappeTestCase):
             sso_enabled=1,
             brew93_base_url="https://brew93.example",
             brew93_tenant_id=TENANT,
+            brew93_tenant_slug="kly",
         )):
             self.assertTrue(settings.sso_is_enabled_and_configured())
 
@@ -309,6 +311,7 @@ class TestSSOGuards(FrappeTestCase):
     def test_workspace_link_is_admin_only_and_does_not_store_login_secrets(self):
         auth = {
             "claims": {"sub": "brew-user-1", "tenant_id": TENANT, "email": "admin@brew93.test"},
+            "identity": {"sub": "brew-user-1", "tenant_id": TENANT, "workspace_slug": "kly"},
             "refresh_token": "refresh-secret",
         }
         settings_doc = MagicMock(name="Brew93 Connector Settings")
@@ -316,20 +319,17 @@ class TestSSOGuards(FrappeTestCase):
         with patch.object(frappe.local, "session", frappe._dict(user="Sales User")), \
              patch.object(frappe, "get_roles", return_value=["Sales User"]):
             with self.assertRaises(frappe.PermissionError):
-                settings.link_workspace("https://brew93.test", TENANT, "kly", "admin@brew93.test", "password")
+                settings.link_workspace("https://brew93.test", "kly", "admin@brew93.test", "password")
 
         with patch.object(frappe.local, "session", frappe._dict(user="Administrator")), \
              patch.object(settings, "_doc", return_value=settings_doc), \
              patch("brew93_connector.api.client.brew93_workspace_authenticate", return_value=auth) as authenticate, \
              patch.object(settings, "set_encrypted_password") as encrypt, \
              patch.object(settings_doc, "db_set") as db_set:
-            result = settings.link_workspace(
-                "https://brew93.test", TENANT, "kly", "admin@brew93.test", "password"
-            )
+            result = settings.link_workspace("https://brew93.test", "kly", "admin@brew93.test", "password")
 
         authenticate.assert_called_once_with(
-            {"brew93_base_url": "https://brew93.test", "brew93_tenant_id": TENANT,
-             "brew93_tenant_slug": "kly", "request_timeout": 10},
+            {"brew93_base_url": "https://brew93.test/api/v1", "brew93_tenant_slug": "kly", "request_timeout": 10},
             "admin@brew93.test", "password",
         )
         encrypt.assert_called_once_with(
@@ -339,6 +339,201 @@ class TestSSOGuards(FrappeTestCase):
         self.assertNotIn("password", stored)
         self.assertNotIn("access_token", stored)
         self.assertEqual(result["tenant_id"], TENANT)
+
+    def test_workspace_link_uses_canonical_default_when_url_is_omitted(self):
+        auth = {
+            "claims": {"sub": "brew-user-1", "tenant_id": TENANT, "email": "admin@brew93.test"},
+            "identity": {"sub": "brew-user-1", "tenant_id": TENANT, "workspace_slug": "kly"},
+            "refresh_token": "refresh-secret",
+        }
+        settings_doc = MagicMock(name="Brew93 Connector Settings")
+        settings_doc.name = "Brew93 Connector Settings"
+        with patch.object(frappe.local, "session", frappe._dict(user="Administrator")), \
+             patch.object(settings, "_doc", return_value=settings_doc), \
+             patch.object(settings, "set_encrypted_password"), \
+             patch("brew93_connector.api.client.brew93_workspace_authenticate", return_value=auth) as authenticate, \
+             patch.object(settings_doc, "db_set"):
+            settings.link_workspace(None, "kly", "admin@brew93.test", "password")
+        self.assertEqual(authenticate.call_args.args[0]["brew93_base_url"], settings.DEFAULT_BREW93_BASE_URL)
+
+    def test_setup_connector_registers_server_side_credentials_only(self):
+        settings_doc = MagicMock(name="Brew93 Connector Settings")
+        settings_doc.name = "Brew93 Connector Settings"
+        settings_doc.get.side_effect = lambda field: {
+            "enabled": 0, "brew93_tenant_id": TENANT, "brew93_tenant_slug": "kly",
+        }.get(field)
+        auth = {"claims": {"sub": "brew-user-1", "tenant_id": TENANT, "email": "admin@brew93.test"},
+                "identity": {"sub": "brew-user-1", "tenant_id": TENANT, "workspace_slug": "kly"},
+                "refresh_token": "refresh-secret"}
+        credentials = {"user": "brew93-integration@rag.klyonix.in", "api_key": "api-key", "api_secret": "api-secret"}
+        with patch.object(frappe.local, "session", frappe._dict(user="Administrator")), \
+             patch.object(settings, "_doc", return_value=settings_doc), \
+             patch.object(settings, "set_encrypted_password"), \
+             patch("brew93_connector.api.client.brew93_workspace_authenticate", return_value=auth), \
+             patch("brew93_connector.setup.integration_user.ensure_integration_credentials", return_value=credentials), \
+             patch("brew93_connector.api.client.register_frappe_integration") as register:
+            result = settings.setup_connector("https://brew93.test", "kly", "admin@brew93.test", "password")
+
+        register.assert_called_once()
+        self.assertEqual(register.call_args.args[1:], ("api-key", "api-secret"))
+        self.assertNotIn("api-secret", repr(result))
+        self.assertEqual(result["tenant_id"], TENANT)
+        registered_values = register.call_args.args[0]
+        self.assertEqual(registered_values["brew93_base_url"], "https://brew93.test/api/v1")
+
+    def test_setup_connector_preserves_current_frappe_session(self):
+        settings_doc = MagicMock(name="Brew93 Connector Settings")
+        settings_doc.name = "Brew93 Connector Settings"
+        settings_doc.get.side_effect = lambda field: {"enabled": 0}.get(field)
+        auth = {
+            "claims": {"sub": "brew-user-1", "tenant_id": TENANT, "email": "admin@brew93.test"},
+            "identity": {"sub": "brew-user-1", "tenant_id": TENANT, "workspace_slug": "kly"},
+            "refresh_token": "refresh-secret",
+        }
+        login_manager = MagicMock(user="Administrator")
+        session = frappe._dict(user="Administrator", sid="current-sid", data={"marker": "current"})
+        with patch.object(frappe.local, "session", session), \
+             patch.object(frappe.local, "login_manager", login_manager, create=True), \
+             patch.object(settings, "_doc", return_value=settings_doc), \
+             patch.object(settings, "set_encrypted_password"), \
+             patch("brew93_connector.api.client.brew93_workspace_authenticate", return_value=auth), \
+             patch("brew93_connector.setup.integration_user.ensure_integration_credentials", return_value={"user": "u", "api_key": "k", "api_secret": "s"}), \
+             patch("brew93_connector.api.client.register_frappe_integration"):
+            settings.setup_connector("https://brew93.test", "kly", "admin@brew93.test", "password")
+
+        self.assertEqual(session.user, "Administrator")
+        self.assertEqual(session.sid, "current-sid")
+        self.assertEqual(session.data, {"marker": "current"})
+        self.assertEqual(login_manager.user, "Administrator")
+        login_manager.login_as.assert_not_called()
+        login_manager.logout.assert_not_called()
+
+    def test_setup_connector_preserves_current_frappe_session_on_failure(self):
+        session = frappe._dict(user="System Manager", sid="current-sid", data={"marker": "current"})
+        login_manager = MagicMock(user="System Manager")
+        with patch.object(frappe.local, "session", session), \
+             patch.object(frappe, "get_roles", return_value=["System Manager"]), \
+             patch.object(frappe.local, "login_manager", login_manager, create=True), \
+             patch.object(settings, "_link_workspace", side_effect=RuntimeError("Brew93 unavailable")):
+            with self.assertRaises(RuntimeError):
+                settings.setup_connector("https://brew93.test", "kly", "admin@brew93.test", "password")
+
+        self.assertEqual(session.user, "System Manager")
+        self.assertEqual(session.sid, "current-sid")
+        self.assertEqual(session.data, {"marker": "current"})
+        self.assertEqual(login_manager.user, "System Manager")
+        login_manager.login_as.assert_not_called()
+        login_manager.logout.assert_not_called()
+
+    def test_setup_connector_auth_failure_raises_validation_error_to_preserve_session(self):
+        auth_err = frappe.AuthenticationError("Invalid Brew93 email or password.")
+        with patch.object(frappe.local, "session", frappe._dict(user="Administrator")), \
+             patch("brew93_connector.api.client.brew93_workspace_authenticate", side_effect=auth_err):
+            with self.assertRaises(frappe.ValidationError):
+                settings._link_workspace("https://brew93.test", "kly", "admin@brew93.test", "bad-pass")
+
+    def test_setup_connector_preserves_response_and_nested_session_state(self):
+        settings_doc = MagicMock(name="Brew93 Connector Settings")
+        settings_doc.name = "Brew93 Connector Settings"
+        settings_doc.get.side_effect = lambda field: {"enabled": 0}.get(field)
+        auth = {
+            "claims": {"sub": "brew-user-1", "tenant_id": TENANT, "email": "admin@brew93.test"},
+            "identity": {"sub": "brew-user-1", "tenant_id": TENANT, "workspace_slug": "kly"},
+            "refresh_token": "refresh-secret",
+        }
+        session = frappe._dict(user="System Manager", sid="current-sid", data={"marker": {"keep": True}})
+        response = {"home_page": "/app", "cookies": [{"name": "sid", "value": "current"}]}
+        with patch.object(frappe.local, "session", session), \
+             patch.object(frappe, "get_roles", return_value=["System Manager"]), \
+             patch.object(frappe.local, "response", response, create=True), \
+             patch.object(frappe.local, "login_manager", MagicMock(user="System Manager"), create=True), \
+             patch.object(settings, "_doc", return_value=settings_doc), \
+             patch.object(settings, "set_encrypted_password"), \
+             patch("brew93_connector.api.client.brew93_workspace_authenticate", return_value=auth), \
+             patch("brew93_connector.setup.integration_user.ensure_integration_credentials", return_value={"user": "u", "api_key": "k", "api_secret": "s"}), \
+             patch("brew93_connector.api.client.register_frappe_integration"):
+            settings.setup_connector("https://brew93.test", "kly", "admin@brew93.test", "password")
+
+        self.assertEqual(session.data, {"marker": {"keep": True}})
+        self.assertEqual(response, {"home_page": "/app", "cookies": [{"name": "sid", "value": "current"}]})
+
+    def test_setup_status_allows_system_manager_without_exposing_secrets(self):
+        settings_doc = MagicMock()
+        settings_doc.get.side_effect = lambda field: {
+            "enabled": 1,
+            "brew93_connection_status": "Connected",
+            "brew93_tenant_id": TENANT,
+            "brew93_tenant_slug": "kly",
+        }.get(field)
+        with patch.object(frappe.local, "session", frappe._dict(user="System Manager")), \
+             patch.object(frappe, "get_roles", return_value=["System Manager"]), \
+             patch.object(settings, "_doc", return_value=settings_doc), \
+             patch.object(settings, "get_workspace_refresh_token", return_value="refresh-secret"), \
+             patch("brew93_connector.api.constants.INTEGRATION_USER", "integration@example.com"), \
+             patch.object(frappe.db, "exists", return_value=False):
+            result = settings.get_setup_status()
+
+        self.assertEqual(result["status"], "Connected")
+        self.assertNotIn("refresh-secret", repr(result))
+
+    def test_setup_status_does_not_redirect_or_replace_response(self):
+        settings_doc = MagicMock()
+        settings_doc.get.side_effect = lambda field: {"enabled": 0}.get(field)
+        response = {"home_page": "/app", "cookies": [{"name": "sid", "value": "current"}]}
+        with patch.object(frappe.local, "session", frappe._dict(user="Administrator")), \
+             patch.object(settings, "_doc", return_value=settings_doc), \
+             patch.object(settings, "get_workspace_refresh_token", return_value=None), \
+             patch.object(frappe.db, "exists", return_value=False), \
+             patch.object(frappe.local, "response", response, create=True):
+            result = settings.get_setup_status()
+
+        self.assertFalse(result["connected"])
+        self.assertEqual(response, {"home_page": "/app", "cookies": [{"name": "sid", "value": "current"}]})
+        self.assertFalse(getattr(frappe.local.flags, "redirect_location", None))
+
+    def test_setup_page_does_not_auto_login_on_load(self):
+        page = Path(__file__).parents[1] / "brew93_connector/page/brew93_integration/brew93_integration.js"
+        source = page.read_text()
+        load_body = source.split("page.set_primary_action", 1)[0]
+        self.assertNotIn("api.sso.login", load_body)
+        self.assertNotIn("login_as", load_body)
+        self.assertNotIn("setup_connector", load_body)
+
+    def test_setup_resolves_canonical_tenant_id_from_authenticated_identity(self):
+        settings_doc = MagicMock(name="Brew93 Connector Settings")
+        settings_doc.name = "Brew93 Connector Settings"
+        settings_doc.get.side_effect = lambda field: {
+            "brew93_base_url": "https://brew93.test/api/v1",
+            "brew93_tenant_id": None,
+            "brew93_tenant_slug": "kly",
+            "request_timeout": 30,
+        }.get(field)
+        auth = {
+            "claims": {"sub": "brew-user-1"},
+            "identity": {"sub": "brew-user-1", "tenant_id": TENANT, "workspace_slug": "kly"},
+            "refresh_token": "refresh-secret",
+        }
+        with patch.object(frappe.local, "session", frappe._dict(user="Administrator")), \
+             patch.object(settings, "_doc", return_value=settings_doc), \
+             patch.object(settings, "set_encrypted_password"), \
+             patch("brew93_connector.api.client.brew93_workspace_authenticate", return_value=auth), \
+             patch("brew93_connector.setup.integration_user.ensure_integration_credentials", return_value={"user": "u", "api_key": "k", "api_secret": "s"}), \
+             patch("brew93_connector.api.client.register_frappe_integration"):
+            result = settings.setup_connector("https://brew93.test", "kly", "admin@brew93.test", "password")
+        stored = settings_doc.db_set.call_args_list[0].args[0]
+        self.assertEqual(stored["brew93_tenant_id"], TENANT)
+        self.assertEqual(result["tenant_id"], TENANT)
+
+    def test_setup_does_not_accept_a_user_supplied_tenant_id(self):
+        with self.assertRaises(TypeError):
+            settings.setup_connector("https://brew93.test", TENANT, "kly", "admin@brew93.test", "password")
+
+    def test_setup_connector_allows_system_manager_but_link_workspace_remains_admin_only(self):
+        with patch.object(frappe.local, "session", frappe._dict(user="System Manager")), \
+             patch.object(frappe, "get_roles", return_value=["System Manager"]):
+            settings._require_system_manager()
+            with self.assertRaises(frappe.PermissionError):
+                settings._require_setup_admin()
 
     def test_login_refuses_disabled_user(self):
         from unittest.mock import MagicMock
