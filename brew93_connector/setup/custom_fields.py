@@ -53,7 +53,11 @@ def _field_defs():
             "insert_after": "brew93_tenant_id",
         },
     ]
-    return {dt: [dict(f) for f in common] for dt in SYNCED_DOCTYPES}
+    fields = {dt: [dict(f) for f in common] for dt in SYNCED_DOCTYPES}
+    # Lead identity is scoped by tenant; the database composite index is
+    # installed by ensure_lead_external_id_index().
+    fields["Lead"][1]["unique"] = 0
+    return fields
 
 
 def _user_link_field():
@@ -103,7 +107,69 @@ def _user_link_field():
 def create_external_id_fields():
     create_custom_fields(_field_defs(), ignore_validate=True)
     create_custom_fields(_user_link_field(), ignore_validate=True)
+    ensure_lead_external_id_index()
     frappe.db.commit()
+
+
+def ensure_lead_external_id_index():
+    """Make Lead identity unique on (tenant, Brew93 id), including old sites."""
+    if not frappe.db.table_exists("Lead"):
+        return
+
+    duplicate_groups = frappe.db.sql(
+        """
+        SELECT brew93_tenant_id, brew93_id
+        FROM `tabLead`
+        WHERE brew93_tenant_id IS NOT NULL
+          AND brew93_id IS NOT NULL AND brew93_id != ''
+        GROUP BY brew93_tenant_id, brew93_id
+        HAVING COUNT(*) > 1
+        """,
+        as_dict=True,
+    )
+
+    # Older installs made brew93_id globally unique. Remove only that index;
+    # dropping an index cannot delete or change any Lead data. Other external-id
+    # fields retain their existing uniqueness guarantees.
+    indexes = frappe.db.sql(
+        """
+        SELECT index_name, non_unique, GROUP_CONCAT(column_name ORDER BY seq_in_index)
+        FROM information_schema.statistics
+        WHERE table_schema = DATABASE() AND table_name = 'tabLead'
+        GROUP BY index_name, non_unique
+        """,
+        as_list=True,
+    )
+    for index_name, non_unique, columns in indexes:
+        if not non_unique and columns == "brew93_id":
+            frappe.db.sql("ALTER TABLE `tabLead` DROP INDEX `{}`".format(index_name.replace("`", "``")))
+
+    if duplicate_groups:
+        conflicts = ", ".join(
+            f"tenant={group.brew93_tenant_id!r}, brew93_id={group.brew93_id!r}"
+            for group in duplicate_groups
+        )
+        frappe.logger("brew93_connector").warning(
+            "Cannot create unique Lead index brew93_lead_tenant_id: "
+            f"same-tenant duplicate groups exist ({conflicts}). "
+            "No Leads were deleted; resolve the duplicates and rerun migration."
+        )
+        return
+
+    indexes = frappe.db.sql(
+        """
+        SELECT index_name
+        FROM information_schema.statistics
+        WHERE table_schema = DATABASE() AND table_name = 'tabLead'
+          AND index_name = 'brew93_lead_tenant_id'
+        """,
+        as_list=True,
+    )
+    if not indexes:
+        frappe.db.sql(
+            "ALTER TABLE `tabLead` ADD UNIQUE INDEX `brew93_lead_tenant_id` "
+            "(`brew93_tenant_id`, `brew93_id`)"
+        )
 
 
 def remove_external_id_fields():

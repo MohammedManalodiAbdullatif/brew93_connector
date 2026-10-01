@@ -12,9 +12,30 @@ from frappe.tests.utils import FrappeTestCase
 
 from brew93_connector.api import v1
 from brew93_connector.api import backfill
+from brew93_connector.setup import custom_fields
 
 TENANT = "00000000-0000-0000-0000-000000000000"
 SETTINGS = {"brew93_tenant_id": TENANT, "source_site": "rag.klyonix.in"}
+
+
+class TestLeadExternalIdMigration(FrappeTestCase):
+    def test_duplicate_leads_are_preserved_and_index_is_skipped(self):
+        duplicate = frappe._dict(brew93_tenant_id=TENANT, brew93_id="duplicate-id")
+        with patch.object(frappe.db, "table_exists", return_value=True), \
+                patch.object(frappe.db, "sql", side_effect=[
+                    [duplicate],
+                    [("uniq_brew93_id", 0, "brew93_id")],
+                    [],
+                ]) as sql, \
+                patch.object(frappe, "logger") as logger, \
+                patch.object(frappe, "delete_doc") as delete_doc:
+            custom_fields.ensure_lead_external_id_index()
+
+        self.assertFalse(delete_doc.called)
+        self.assertEqual(sql.call_count, 3)
+        self.assertIn("DROP INDEX", sql.call_args_list[2].args[0])
+        self.assertNotIn("ADD UNIQUE INDEX", " ".join(str(call) for call in sql.call_args_list))
+        logger.assert_called_once_with("brew93_connector")
 
 
 class TestApplyLead(FrappeTestCase):
@@ -48,6 +69,51 @@ class TestApplyLead(FrappeTestCase):
         self.assertEqual(frappe.get_doc("Lead", name2).email_id, e2)
         self.assertEqual(frappe.db.count("Lead", {"brew93_id": bid}), 1)
 
+    def test_repeated_delivery_updates_canonical_lead(self):
+        bid = str(uuid.uuid4())
+        name, _ = v1._apply_lead(bid, TENANT, None, {"lead_name": "Original"})
+        retry_name, action = v1._apply_lead(bid, TENANT, None, {"lead_name": "Retry"})
+
+        self.assertEqual((retry_name, action), (name, "updated"))
+        self.assertEqual(frappe.db.count("Lead", {"brew93_id": bid}), 1)
+        self.assertEqual(frappe.db.get_value("Lead", name, "lead_name"), "Retry")
+
+    def test_concurrent_style_duplicate_insert_reloads_canonical_lead(self):
+        bid = str(uuid.uuid4())
+        canonical, _ = v1._apply_lead(bid, TENANT, None, {"lead_name": "Canonical"})
+        pending = frappe.new_doc("Lead")
+        original_new_doc = v1.frappe.new_doc
+        original_existing_name = v1._existing_name
+        lookups = iter((None, canonical))
+        try:
+            def new_doc(doctype, *args, **kwargs):
+                if doctype == "Lead" and not kwargs.get("parent_doc"):
+                    return pending
+                return original_new_doc(doctype, *args, **kwargs)
+
+            v1.frappe.new_doc = new_doc
+            v1._existing_name = lambda doctype, external_id, tenant: next(lookups)
+            original_insert = pending.insert
+            pending.insert = lambda **kwargs: (_ for _ in ()).throw(Exception("Duplicate entry"))
+            name, action = v1._apply_lead(bid, TENANT, None, {"lead_name": "Retry wins"})
+        finally:
+            v1.frappe.new_doc = original_new_doc
+            v1._existing_name = original_existing_name
+            pending.insert = original_insert
+
+        self.assertEqual((name, action), (canonical, "updated"))
+        self.assertEqual(frappe.db.get_value("Lead", canonical, "lead_name"), "Retry wins")
+
+    def test_same_brew93_id_is_isolated_by_tenant(self):
+        bid = str(uuid.uuid4())
+        other_tenant = "other-tenant"
+        first, _ = v1._apply_lead(bid, TENANT, None, {"lead_name": "Tenant One"})
+        second, action = v1._apply_lead(bid, other_tenant, None, {"lead_name": "Tenant Two"})
+
+        self.assertNotEqual(first, second)
+        self.assertEqual(action, "created")
+        self.assertEqual(frappe.db.count("Lead", {"brew93_id": bid}), 2)
+
     def test_update_preserves_inbound_lead_fields(self):
         bid = str(uuid.uuid4())
         email = f"after-{uuid.uuid4().hex[:6]}@example.com"
@@ -80,12 +146,12 @@ class TestApplyLead(FrappeTestCase):
         doc = frappe.get_doc("Lead", name)
         self.assertEqual(doc.docstatus, 0)  # not in allow-list, ignored
 
-    def test_cross_tenant_external_id_is_rejected(self):
+    def test_same_external_id_can_belong_to_each_tenant(self):
         bid = str(uuid.uuid4())
         name, _ = v1._apply_lead(bid, "other-tenant", None, {"lead_name": "Other"})
-        with self.assertRaises(v1._ApiError) as ctx:
-            v1._apply_lead(bid, TENANT, None, {"lead_name": "Hijack"})
-        self.assertEqual(ctx.exception.code, "tenant_mismatch")
+        second, action = v1._apply_lead(bid, "other-tenant-2", None, {"lead_name": "Separate"})
+        self.assertNotEqual(name, second)
+        self.assertEqual(action, "created")
         self.assertEqual(frappe.get_doc("Lead", name).lead_name, "Other")
 
 

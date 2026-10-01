@@ -116,20 +116,23 @@ class _ApiError(Exception):
 
 
 def _existing_name(doctype, brew93_id, tenant_id):
-    """Resolve an external id only inside the pinned tenant."""
+    """Resolve the canonical row for the tenant-scoped external id."""
     if not brew93_id:
         return None
     rows = frappe.get_all(
         doctype,
         filters={"brew93_id": brew93_id},
         fields=["name", "brew93_tenant_id"],
-        limit=2,
+        order_by="creation asc, name asc",
     )
     for row in rows:
-        if not row.brew93_tenant_id or str(row.brew93_tenant_id) == str(tenant_id):
+        if str(row.brew93_tenant_id) == str(tenant_id):
             return row.name
-    if rows:
-        raise _ApiError("tenant_mismatch", f"External ID belongs to another tenant.", 409)
+    # A legacy row without tenant metadata can be safely claimed by the first
+    # tenant that retries it. Rows owned by another tenant are not matched.
+    for row in rows:
+        if not row.brew93_tenant_id:
+            return row.name
     return None
 
 
@@ -185,18 +188,7 @@ def _synced_at(brew93_modified):
         return frappe.utils.now()
 
 
-def _apply_lead(brew93_id, tenant_id, brew93_modified, data):
-    existing = _existing_name("Lead", brew93_id, tenant_id)
-    doc = frappe.get_doc("Lead", existing) if existing else frappe.new_doc("Lead")
-
-    # Optional last-write-wins guard: skip if our copy is already newer.
-    if existing and brew93_modified and doc.get("brew93_synced_at"):
-        try:
-            if _synced_at(doc.get("brew93_synced_at")) >= _synced_at(brew93_modified):
-                return doc.name, "unchanged"
-        except Exception:
-            pass
-
+def _populate_lead(doc, brew93_id, tenant_id, brew93_modified, data):
     for field in ALLOWED_LEAD_FIELDS:
         if field in data:
             doc.set(field, data[field])
@@ -212,15 +204,34 @@ def _apply_lead(brew93_id, tenant_id, brew93_modified, data):
     if status:
         doc.status = status
     if not doc.get("status"):
-        doc.status = "Lead"  # required field default for new docs
+        doc.status = "Lead"
 
     src = data.get("source") or data.get("utm_source")
     if src and frappe.db.exists("Lead Source", src):
-        doc.utm_source = src  # never auto-create master data from inbound
+        doc.utm_source = src
 
     doc.brew93_id = brew93_id
     doc.brew93_tenant_id = tenant_id
     doc.brew93_synced_at = _synced_at(brew93_modified)
+
+
+def _is_duplicate_key_error(error):
+    return "duplicate entry" in str(error).lower() or "duplicate key" in str(error).lower()
+
+
+def _apply_lead(brew93_id, tenant_id, brew93_modified, data):
+    existing = _existing_name("Lead", brew93_id, tenant_id)
+    doc = frappe.get_doc("Lead", existing) if existing else frappe.new_doc("Lead")
+
+    # Optional last-write-wins guard: skip if our copy is already newer.
+    if existing and brew93_modified and doc.get("brew93_synced_at"):
+        try:
+            if _synced_at(doc.get("brew93_synced_at")) >= _synced_at(brew93_modified):
+                return doc.name, "unchanged"
+        except Exception:
+            pass
+
+    _populate_lead(doc, brew93_id, tenant_id, brew93_modified, data)
 
     doc.flags.ignore_permissions = True
     doc.flags.ignore_mandatory = True
@@ -230,8 +241,22 @@ def _apply_lead(brew93_id, tenant_id, brew93_modified, data):
             doc.save(ignore_permissions=True)
             action = "updated"
         else:
-            doc.insert(ignore_permissions=True)
-            action = "created"
+            try:
+                doc.insert(ignore_permissions=True)
+                action = "created"
+            except Exception as error:
+                if not _is_duplicate_key_error(error):
+                    raise
+                frappe.db.rollback()
+                existing = _existing_name("Lead", brew93_id, tenant_id)
+                if not existing:
+                    raise
+                doc = frappe.get_doc("Lead", existing)
+                _populate_lead(doc, brew93_id, tenant_id, brew93_modified, data)
+                doc.flags.ignore_permissions = True
+                doc.flags.ignore_mandatory = True
+                doc.save(ignore_permissions=True)
+                action = "updated"
         frappe.db.set_value(doc.doctype, doc.name, {
             "brew93_id": brew93_id,
             "brew93_tenant_id": tenant_id,
